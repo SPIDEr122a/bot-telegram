@@ -137,6 +137,19 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS free_tests (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                status TEXT DEFAULT 'pending',
+                panel_info TEXT,
+                created_at TEXT,
+                delivered_at TEXT
+            )
+            """
+        )
         await db.commit()
 
         # مهاجرت: ستون payment_method به جدول orders (برای دیتابیس‌های قدیمی‌تر که این ستون رو ندارن)
@@ -715,3 +728,65 @@ async def get_wallet_bonus_threshold() -> int:
 async def get_wallet_bonus_percent() -> int:
     val = await get_setting("wallet_bonus_percent")
     return int(val) if val is not None else 5
+
+
+# ---------- تست رایگان (یک‌بار برای هر user_id) ----------
+async def has_claimed_free_test(user_id: int) -> bool:
+    """آیا این کاربر قبلاً تست رایگان گرفته (pending/delivered)؟"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM free_tests WHERE user_id = ? AND status IN ('pending', 'delivered')",
+            (user_id,),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def create_free_test_request(user_id: int, username: str, full_name: str) -> bool:
+    """ثبت درخواست تست رایگان. اگر قبلاً گرفته باشه False برمی‌گردونه."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT status FROM free_tests WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row[0] in ("pending", "delivered"):
+            return False
+        # اگه rejected بوده یا اصلاً نبوده، upsert می‌کنیم
+        await db.execute(
+            """INSERT INTO free_tests (user_id, username, full_name, status, created_at)
+               VALUES (?, ?, ?, 'pending', ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   username = excluded.username,
+                   full_name = excluded.full_name,
+                   status = 'pending',
+                   panel_info = NULL,
+                   created_at = excluded.created_at,
+                   delivered_at = NULL""",
+            (user_id, username, full_name, datetime.now().isoformat()),
+        )
+        await db.commit()
+        return True
+
+
+async def get_free_test(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM free_tests WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone()
+
+
+async def set_free_test_status(user_id: int, status: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE free_tests SET status = ? WHERE user_id = ?", (status, user_id)
+        )
+        await db.commit()
+
+
+async def deliver_free_test(user_id: int, panel_info: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE free_tests SET status = 'delivered', panel_info = ?, delivered_at = ?
+               WHERE user_id = ?""",
+            (panel_info, datetime.now().isoformat(), user_id),
+        )
+        await db.commit()

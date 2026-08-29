@@ -22,6 +22,12 @@ BRAND_NAME = os.getenv("BRAND_NAME", "X4G")
 # آیدی پشتیبانی (بدون @) - در دکمه «ارتباط با پشتیبانی» استفاده میشه
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "SuppX4G")
 
+# کانال‌/گروه‌های عضویت اجباری — با کاما جدا کنید
+# می‌تونه آیدی عددی (مثل -1001234567890) یا یوزرنیم با/بدون @ باشه (مثل @mychannel یا mychannel)
+# مثال Railway: REQUIRED_CHANNELS=-1001234567890,@X4GChannel
+# اگه خالی باشه، عضویت اجباری غیرفعاله
+REQUIRED_CHANNELS = [x.strip() for x in os.getenv("REQUIRED_CHANNELS", "").split(",") if x.strip()]
+
 # تنظیمات سیستم رفرال (دعوت دوستان)
 REFERRAL_REQUIRED_COUNT = int(os.getenv("REFERRAL_REQUIRED_COUNT", "3"))   # تعداد خرید موفق لازم
 REFERRAL_REWARD_VOLUME = int(os.getenv("REFERRAL_REWARD_VOLUME", "50"))   # حجم هدیه گیمینگ (گیگ)

@@ -27,6 +27,96 @@ dp = Dispatcher(storage=MemoryStorage())
 BOT_USERNAME = ""  # در main() پر میشه
 
 
+# ---------- عضویت اجباری ----------
+# وضعیت‌هایی که «عضو» حساب می‌شن
+_MEMBER_OK = {"member", "administrator", "creator", "restricted"}
+
+
+def _normalize_channel(ch: str):
+    """آیدی عددی رو int و یوزرنیم رو با @ برمی‌گردونه."""
+    s = (ch or "").strip()
+    if not s:
+        return s
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return s if s.startswith("@") else f"@{s}"
+
+
+def _member_status_str(member) -> str:
+    st = getattr(member, "status", None)
+    if st is None:
+        return ""
+    return str(getattr(st, "value", st)).lower()
+
+
+async def is_user_member(user_id: int) -> bool:
+    """
+    اگر REQUIRED_CHANNELS خالی باشه یا کاربر ادمین ربات باشه → True.
+    وگرنه باید در همه کانال‌ها عضو (member/admin/creator/restricted) باشه.
+    """
+    if not config.REQUIRED_CHANNELS:
+        return True
+    # ادمین‌های ربات از چک عضویت معاف‌اند
+    if user_id in config.ADMIN_IDS:
+        return True
+
+    for raw in config.REQUIRED_CHANNELS:
+        chat_id = _normalize_channel(raw)
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            status = _member_status_str(member)
+            logging.info(f"Membership: user={user_id} chat={chat_id} status={status}")
+            if status not in _MEMBER_OK:
+                return False
+        except Exception as e:
+            # رایج‌ترین علت: ربات ادمین کانال نیست / آیدی کانال اشتباه است
+            logging.error(f"Membership check FAILED for chat={chat_id} user={user_id}: {e}")
+            return False
+    return True
+
+
+async def build_join_kb() -> InlineKeyboardMarkup:
+    """دکمه‌های جوین به کانال‌ها + دکمه بررسی عضویت."""
+    rows = []
+    for raw in config.REQUIRED_CHANNELS:
+        chat_id = _normalize_channel(raw)
+        url = None
+        label = str(raw).lstrip("@")
+        try:
+            chat = await bot.get_chat(chat_id)
+            title = getattr(chat, "title", None) or label
+            if getattr(chat, "username", None):
+                url = f"https://t.me/{chat.username}"
+            else:
+                # کانال خصوصی: سعی می‌کنیم لینک دعوت بگیریم (ربات باید ادمین با حق دعوت باشه)
+                try:
+                    inv = await bot.create_chat_invite_link(chat_id, name="bot-join")
+                    url = inv.invite_link
+                except Exception:
+                    url = getattr(chat, "invite_link", None)
+            label = title
+        except Exception as e:
+            logging.warning(f"Could not resolve channel {chat_id}: {e}")
+            if isinstance(chat_id, str) and chat_id.startswith("@"):
+                url = f"https://t.me/{chat_id.lstrip('@')}"
+        if url:
+            rows.append([InlineKeyboardButton(text=f"📢 عضویت در {label}", url=url)])
+        else:
+            rows.append(
+                [InlineKeyboardButton(text=f"📢 عضویت در {label}", callback_data="join_info")]
+            )
+    rows.append([InlineKeyboardButton(text="✅ بررسی عضویت", callback_data="check_membership")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+JOIN_REQUIRED_TEXT = (
+    "🔒 <b>عضویت اجباری</b>\n\n"
+    "برای استفاده از ربات، ابتدا در کانال‌/گروه‌های زیر عضو شوید، "
+    "سپس روی دکمه «✅ بررسی عضویت» بزنید.\n\n"
+    "اگر عضو نشده باشید، امکان استفاده از ربات وجود ندارد."
+)
+
+
 # ---------- Rate limit / آنتی‌اسپم ----------
 class ThrottlingMiddleware(BaseMiddleware):
     """جلوگیری از اسپم کردن دکمه‌ها یا ثبت پشت‌سرهم سفارش توسط یه کاربر."""
@@ -66,6 +156,7 @@ class WalletStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_panel_info = State()
     waiting_for_reject_reason = State()
+    waiting_for_freetest_info = State()
     editing_gaming_price = State()
     editing_multi_price = State()
     adding_gaming_volume = State()
@@ -86,8 +177,9 @@ class AdminStates(StatesGroup):
 def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text="🛍 خرید سرویس"), KeyboardButton(text="🖥 سرویس‌های من")],
-        [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="💬 پشتیبانی")],
-        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="📜 قوانین")],
+        [KeyboardButton(text="🎁 تست رایگان"), KeyboardButton(text="💰 کیف پول")],
+        [KeyboardButton(text="💬 پشتیبانی"), KeyboardButton(text="🤝 دعوت دوستان")],
+        [KeyboardButton(text="📜 قوانین")],
     ]
     if user_id is not None and user_id in config.ADMIN_IDS:
         keyboard.append([KeyboardButton(text="🛠 مدیریت ربات")])
@@ -221,6 +313,15 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
                     except Exception as e:
                         logging.warning(f"Could not notify referrer {referrer_id}: {e}")
 
+    # عضویت اجباری: اگر عضو نباشه فقط صفحه جوین نشون داده میشه
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(
+            JOIN_REQUIRED_TEXT,
+            parse_mode="HTML",
+            reply_markup=await build_join_kb(),
+        )
+        return
+
     custom_welcome = await db.get_welcome_message()
     if custom_welcome:
         text = custom_welcome
@@ -236,9 +337,59 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb(message.from_user.id))
 
 
+@dp.callback_query(F.data == "check_membership")
+async def check_membership_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not config.REQUIRED_CHANNELS:
+        await callback.answer("عضویت اجباری فعال نیست.", show_alert=True)
+        return
+
+    # ادمین همیشه عبور می‌کنه
+    if callback.from_user.id in config.ADMIN_IDS or await is_user_member(callback.from_user.id):
+        try:
+            await callback.message.edit_text("✅ عضویت شما تأیید شد! می‌تونید از ربات استفاده کنید.")
+        except Exception:
+            pass
+        custom_welcome = await db.get_welcome_message()
+        if custom_welcome:
+            text = custom_welcome
+        else:
+            text = (
+                f"✨ <b>{config.BRAND_NAME}</b> ✨\n\n"
+                f"👋 به پلتفرم فروش سرویس {config.BRAND_NAME} خوش اومدید"
+            )
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb(callback.from_user.id))
+        await callback.answer("عضویت تأیید شد ✅")
+        return
+
+    # لاگ فنی فقط در سرور؛ به کاربر پیام ساده نشون می‌دیم
+    for raw in config.REQUIRED_CHANNELS:
+        chat_id = _normalize_channel(raw)
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=callback.from_user.id)
+            status = _member_status_str(member)
+            if status not in _MEMBER_OK:
+                logging.info(f"User {callback.from_user.id} not member of {chat_id}: {status}")
+        except Exception as e:
+            logging.error(f"check_membership error chat={chat_id}: {e}")
+
+    await callback.answer("❌ عضویت تأیید نشد. لطفاً اول عضو شوید.", show_alert=True)
+
+
+@dp.callback_query(F.data == "join_info")
+async def join_info_handler(callback: CallbackQuery):
+    await callback.answer(
+        "لینک عمومی این کانال در دسترس نیست. از طریق جست‌وجو در تلگرام عضو شوید یا با پشتیبانی در ارتباط باشید.",
+        show_alert=True,
+    )
+
+
 @dp.message(F.text == "🛍 خرید سرویس")
 async def show_services(message: Message, state: FSMContext):
     await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
     await message.answer("🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:", reply_markup=services_kb())
 
 
@@ -612,6 +763,9 @@ def order_detail_text(order) -> str:
 @dp.message(F.text == "🖥 سرویس‌های من")
 async def my_orders(message: Message, state: FSMContext):
     await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
     orders = await db.get_user_orders(message.from_user.id)
     if not orders:
         await message.answer("شما هنوز هیچ سفارشی ثبت نکردید.", reply_markup=back_menu_kb())
@@ -692,9 +846,156 @@ def topup_decision_kb(topup_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def free_test_admin_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ تحویل تست", callback_data=f"ftapprove:{user_id}"),
+                InlineKeyboardButton(text="❌ رد", callback_data=f"ftreject:{user_id}"),
+            ]
+        ]
+    )
+
+
+@dp.message(F.text == "🎁 تست رایگان")
+async def free_test_handler(message: Message, state: FSMContext):
+    await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
+
+    user_id = message.from_user.id
+    if await db.has_claimed_free_test(user_id):
+        existing = await db.get_free_test(user_id)
+        status = existing["status"] if existing else "?"
+        if status == "pending":
+            await message.answer(
+                "⏳ درخواست تست رایگان شما قبلاً ثبت شده و در صف بررسی ادمینه.\n"
+                "لطفاً صبور باشید.",
+                reply_markup=main_menu_kb(user_id),
+            )
+        else:
+            await message.answer(
+                "❌ شما قبلاً از تست رایگان استفاده کردید.\n"
+                "هر آیدی فقط یک‌بار می‌تونه تست رایگان بگیره.",
+                reply_markup=main_menu_kb(user_id),
+            )
+        return
+
+    ok = await db.create_free_test_request(
+        user_id,
+        message.from_user.username or "",
+        message.from_user.full_name,
+    )
+    if not ok:
+        await message.answer(
+            "❌ شما قبلاً از تست رایگان استفاده کردید.",
+            reply_markup=main_menu_kb(user_id),
+        )
+        return
+
+    await message.answer(
+        "✅ درخواست تست رایگان شما ثبت شد.\n"
+        "به‌محض بررسی توسط ادمین، اطلاعات تست براتون ارسال می‌شه.",
+        reply_markup=main_menu_kb(user_id),
+    )
+
+    caption = (
+        f"🎁 درخواست تست رایگان\n"
+        f"👤 کاربر: {message.from_user.full_name} (@{message.from_user.username or '-'})\n"
+        f"🆔 آیدی عددی: <code>{user_id}</code>"
+    )
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                caption,
+                parse_mode="HTML",
+                reply_markup=free_test_admin_kb(user_id),
+            )
+        except Exception as e:
+            logging.warning(f"Could not notify admin {admin_id} about free test: {e}")
+
+
+@dp.callback_query(F.data.startswith("ftapprove:"))
+async def admin_approve_free_test(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[1])
+    ft = await db.get_free_test(user_id)
+    if not ft:
+        await callback.answer("درخواست پیدا نشد.", show_alert=True)
+        return
+    if ft["status"] == "delivered":
+        await callback.answer("این تست قبلاً تحویل داده شده.", show_alert=True)
+        return
+
+    await state.update_data(freetest_user_id=user_id)
+    await state.set_state(AdminStates.waiting_for_freetest_info)
+    await callback.message.answer(
+        f"✅ درخواست تست کاربر <code>{user_id}</code> تأیید شد.\n"
+        f"حالا اطلاعات/کانفیگ تست رایگان رو برای ارسال به کاربر بفرستید:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_freetest_info)
+async def admin_send_free_test_info(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get("freetest_user_id")
+    if not user_id:
+        await message.answer("مشکلی پیش اومد.")
+        await state.clear()
+        return
+
+    panel_info = message.text or message.caption or ""
+    await db.deliver_free_test(user_id, panel_info)
+    await state.clear()
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 تست رایگان شما آماده شد!\n\n"
+            f"🔑 اطلاعات تست:\n{panel_info}",
+        )
+        await message.answer(f"✅ اطلاعات تست با موفقیت برای کاربر {user_id} ارسال شد.")
+    except Exception as e:
+        await message.answer(f"⚠️ ارسال به کاربر ناموفق بود: {e}")
+
+
+@dp.callback_query(F.data.startswith("ftreject:"))
+async def admin_reject_free_test(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[1])
+    ft = await db.get_free_test(user_id)
+    if not ft:
+        await callback.answer("درخواست پیدا نشد.", show_alert=True)
+        return
+
+    await db.set_free_test_status(user_id, "rejected")
+    try:
+        await bot.send_message(
+            user_id,
+            "❌ متأسفانه درخواست تست رایگان شما رد شد.\n"
+            "در صورت سؤال با پشتیبانی در ارتباط باشید.",
+        )
+    except Exception as e:
+        logging.warning(f"Could not notify user about free test reject: {e}")
+
+    await callback.message.answer(f"❌ تست رایگان کاربر {user_id} رد شد.")
+    await callback.answer()
+
+
 @dp.message(F.text == "💰 کیف پول")
 async def wallet_handler(message: Message, state: FSMContext):
     await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
     balance = await db.get_wallet_balance(message.from_user.id)
     threshold = await db.get_wallet_bonus_threshold()
     bonus_percent = await db.get_wallet_bonus_percent()
@@ -908,6 +1209,9 @@ async def admin_reject_topup(callback: CallbackQuery):
 @dp.message(F.text == "💬 پشتیبانی")
 async def support_handler(message: Message, state: FSMContext):
     await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📞 ارتباط با پشتیبانی", url=f"https://t.me/{config.SUPPORT_USERNAME}")],
@@ -935,6 +1239,9 @@ DEFAULT_RULES_TEXT = (
 @dp.message(F.text == "📜 قوانین")
 async def rules_handler(message: Message, state: FSMContext):
     await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
     custom_rules = await db.get_rules_text()
     text = custom_rules if custom_rules else DEFAULT_RULES_TEXT
     await message.answer(text, parse_mode="HTML", reply_markup=back_menu_kb())
@@ -943,6 +1250,9 @@ async def rules_handler(message: Message, state: FSMContext):
 @dp.message(F.text == "🤝 دعوت دوستان")
 async def invite_handler(message: Message, state: FSMContext):
     await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
     referrer_id = message.from_user.id
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{referrer_id}"
     total = await db.count_referrals(referrer_id)
