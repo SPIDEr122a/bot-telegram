@@ -49,3 +49,61 @@ DEFAULT_MULTI_PLANS = [
     ("تک کاربره نامحدود دو‌ماهه", 250000),
     ("دو کاربره نامحدود دو‌ماهه", 450000),
 ]
+
+# ---------- پنل پاسارگارد (تست خودکار) ----------
+# اگر PASARGUARD_BASE_URL خالی باشه، تست رایگان دستی (توسط ادمین) می‌مونه
+PASARGUARD_BASE_URL = os.getenv("PASARGUARD_BASE_URL", "").rstrip("/")
+PASARGUARD_USERNAME = os.getenv("PASARGUARD_USERNAME", "")
+PASARGUARD_PASSWORD = os.getenv("PASARGUARD_PASSWORD", "")
+PASARGUARD_API_KEY = os.getenv("PASARGUARD_API_KEY", "")  # اختیاری؛ اگر باشه به‌جای یوزر/پسورد
+
+# قالب تست (اختیاری). اگر ست بشه، کاربر از روی قالب ساخته می‌شه
+PASARGUARD_TEST_TEMPLATE_ID = os.getenv("PASARGUARD_TEST_TEMPLATE_ID", "").strip() or None
+if PASARGUARD_TEST_TEMPLATE_ID is not None:
+    try:
+        PASARGUARD_TEST_TEMPLATE_ID = int(PASARGUARD_TEST_TEMPLATE_ID)
+    except ValueError:
+        PASARGUARD_TEST_TEMPLATE_ID = None
+
+# اگر قالب نباشد، از این مقادیر برای ساخت کاربر استفاده می‌شود
+PASARGUARD_TEST_DATA_LIMIT_GB = float(os.getenv("PASARGUARD_TEST_DATA_LIMIT_GB", "0.3"))  # گیگ
+PASARGUARD_TEST_EXPIRE_HOURS = int(os.getenv("PASARGUARD_TEST_EXPIRE_HOURS", "48"))
+
+# گروه‌های تست — می‌تونی اسم گروه یا آیدی عددی بنویسی (با کاما جدا کن)
+# مثال با اسم: PASARGUARD_TEST_GROUPS=gaming,multi
+# مثال با آیدی: PASARGUARD_TEST_GROUPS=1,3
+# (نام متغیر قدیمی PASARGUARD_TEST_GROUP_IDS هم هنوز کار می‌کنه)
+_raw_groups = os.getenv("PASARGUARD_TEST_GROUPS") or os.getenv("PASARGUARD_TEST_GROUP_IDS") or ""
+PASARGUARD_TEST_GROUPS = [x.strip() for x in _raw_groups.split(",") if x.strip()]
+
+# پیشوند نام کاربری تست (مثلاً test_)
+PASARGUARD_TEST_USERNAME_PREFIX = os.getenv("PASARGUARD_TEST_USERNAME_PREFIX", "test_")
+
+# متن‌های نمایشی در پیام تحویل (قابل تغییر از Variables)
+PASARGUARD_TEST_LOCATION_NAME = os.getenv("PASARGUARD_TEST_LOCATION_NAME", "مولتی لوکیشن")
+PASARGUARD_TEST_SERVICE_NAME = os.getenv("PASARGUARD_TEST_SERVICE_NAME", "تست")
+
+# قالب پیام تحویل — از این placeholderها استفاده کنید:
+# {username} {location} {duration} {volume} {subscription_url} {service_name}
+PASARGUARD_TEST_MESSAGE = os.getenv(
+    "PASARGUARD_TEST_MESSAGE",
+    (
+        "✅ تست با موفقیت آماده شد\n\n"
+        "👤 نام کاربری تست : {username}\n"
+        "🌐 لوکیشن : {location}\n"
+        "⌛ مدت زمان : {duration}\n"
+        "📊 حجم تست : {volume}\n\n"
+        "لینک اتصال 📎 :\n"
+        "{subscription_url}\n\n"
+        "🧑‍🦯 شما میتوانید شیوه اتصال را با فشردن دکمه زیر و انتخاب سیستم عامل خود را دریافت کنید"
+    ),
+)
+
+
+def is_panel_auto_enabled() -> bool:
+    """آیا ساخت خودکار تست از پنل فعال است؟"""
+    if not PASARGUARD_BASE_URL:
+        return False
+    if PASARGUARD_API_KEY:
+        return True
+    return bool(PASARGUARD_USERNAME and PASARGUARD_PASSWORD)

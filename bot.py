@@ -894,6 +894,48 @@ async def free_test_handler(message: Message, state: FSMContext):
         )
         return
 
+    # ---- حالت خودکار: ساخت روی پنل پاسارگارد ----
+    if config.is_panel_auto_enabled():
+        wait_msg = await message.answer("⏳ در حال ساخت تست رایگان...")
+        try:
+            import panel as pg_panel
+
+            result = await pg_panel.create_test_account(user_id)
+            await db.deliver_free_test(user_id, result["message"])
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+            await message.answer(
+                result["message"],
+                reply_markup=main_menu_kb(user_id),
+                disable_web_page_preview=True,
+            )
+            # نوتیف موفقیت به ادمین ارسال نمی‌شود (طبق درخواست)
+        except Exception as e:
+            logging.exception("Auto free-test panel error")
+            await db.set_free_test_status(user_id, "rejected")
+            try:
+                await wait_msg.edit_text(
+                    "❌ ساخت تست با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید."
+                )
+            except Exception:
+                await message.answer(
+                    "❌ ساخت تست با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید.",
+                    reply_markup=main_menu_kb(user_id),
+                )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"⚠️ خطا در ساخت تست خودکار برای <code>{user_id}</code>:\n<code>{e}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        return
+
+    # ---- حالت دستی: درخواست برای ادمین ----
     await message.answer(
         "✅ درخواست تست رایگان شما ثبت شد.\n"
         "به‌محض بررسی توسط ادمین، اطلاعات تست براتون ارسال می‌شه.",
