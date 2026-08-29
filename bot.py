@@ -906,11 +906,38 @@ async def free_test_handler(message: Message, state: FSMContext):
                 await wait_msg.delete()
             except Exception:
                 pass
-            await message.answer(
-                result["message"],
-                reply_markup=main_menu_kb(user_id),
-                disable_web_page_preview=True,
-            )
+
+            sub_url = (result.get("subscription_url") or "").strip()
+            # اگر لینک ساب داریم، QR همان کاربر را هم می‌فرستیم
+            if sub_url:
+                try:
+                    from aiogram.types import BufferedInputFile
+
+                    qr_bytes = pg_panel.make_qr_png(sub_url)
+                    await message.answer_photo(
+                        BufferedInputFile(qr_bytes, filename="qr.png"),
+                        caption=result["message"][:1024],
+                        reply_markup=main_menu_kb(user_id),
+                    )
+                    # اگر متن از حد کپشن بیشتر بود، باقی‌اش را جدا می‌فرستیم
+                    if len(result["message"]) > 1024:
+                        await message.answer(
+                            result["message"][1024:],
+                            disable_web_page_preview=True,
+                        )
+                except Exception as qr_err:
+                    logging.warning(f"QR send failed, fallback to text: {qr_err}")
+                    await message.answer(
+                        result["message"],
+                        reply_markup=main_menu_kb(user_id),
+                        disable_web_page_preview=True,
+                    )
+            else:
+                await message.answer(
+                    result["message"],
+                    reply_markup=main_menu_kb(user_id),
+                    disable_web_page_preview=True,
+                )
             # نوتیف موفقیت به ادمین ارسال نمی‌شود (طبق درخواست)
         except Exception as e:
             logging.exception("Auto free-test panel error")
