@@ -129,12 +129,16 @@ async def _fetch_groups_list(client: httpx.AsyncClient, token: str) -> list[dict
     )
 
 
-async def _resolve_group_ids(client: httpx.AsyncClient, token: str) -> list[int]:
+async def _resolve_group_ids(
+    client: httpx.AsyncClient,
+    token: str,
+    group_specs: list[str] | None = None,
+) -> list[int]:
     """
-    PASARGUARD_TEST_GROUPS را به آیدی عددی تبدیل می‌کند.
-    پشتیبانی: اسم گروه، آیدی عددی، یا * / ALL برای همه گروه‌ها.
+    لیست اسم/آیدی گروه را به آیدی عددی تبدیل می‌کند.
+    پشتیبانی: اسم گروه، آیدی عددی، یا * برای همه گروه‌ها.
     """
-    specs = [s.strip() for s in (getattr(config, "PASARGUARD_TEST_GROUPS", None) or []) if s.strip()]
+    specs = [s.strip() for s in (group_specs if group_specs is not None else (getattr(config, "PASARGUARD_TEST_GROUPS", None) or [])) if s.strip()]
     if not specs:
         return []
 
@@ -383,3 +387,176 @@ def _extract_subscription_url(data: dict, base: str) -> str:
             return t
         return f"{base}/sub/{t}"
     return ""
+
+
+def _format_days(days: int) -> str:
+    if days <= 0:
+        return "نامحدود"
+    if days == 1:
+        return "1 روزه"
+    return f"{days} روزه"
+
+
+def build_service_message(
+    username: str,
+    subscription_url: str,
+    *,
+    service_name: str,
+    duration: str,
+    volume: str,
+) -> str:
+    tpl = config.PASARGUARD_SERVICE_MESSAGE or ""
+    return tpl.format(
+        username=username,
+        service_name=service_name,
+        location=config.PASARGUARD_SERVICE_LOCATION_NAME,
+        duration=duration,
+        volume=volume,
+        subscription_url=subscription_url,
+    )
+
+
+async def _create_user_on_panel(
+    client: httpx.AsyncClient,
+    token: str,
+    *,
+    username: str,
+    data_limit_gb: float,
+    expire_days: int,
+    note: str,
+    group_specs: list[str] | None,
+    hwid_limit: int | None = None,
+) -> dict[str, Any]:
+    """ساخت کاربر روی پنل و برگرداندن payload کامل (با subscription_url)."""
+    base = _base()
+    headers = _auth_headers(token)
+
+    if data_limit_gb and data_limit_gb > 0:
+        data_limit_bytes = int(data_limit_gb * (1024**3))
+    else:
+        data_limit_bytes = 0  # نامحدود
+
+    if expire_days and expire_days > 0:
+        expire_ts = int(time.time()) + int(expire_days) * 86400
+    else:
+        expire_ts = 0
+
+    body: dict[str, Any] = {
+        "username": username,
+        "status": "active",
+        "data_limit": data_limit_bytes,
+        "expire": expire_ts,
+        "note": note,
+    }
+    if hwid_limit is not None and hwid_limit > 0:
+        body["hwid_limit"] = hwid_limit
+
+    group_ids = await _resolve_group_ids(client, token, group_specs=group_specs)
+    if group_ids:
+        body["group_ids"] = group_ids
+    else:
+        raise RuntimeError(
+            "No service groups configured. Set PASARGUARD_SERVICE_GROUPS or PASARGUARD_TEST_GROUPS."
+        )
+
+    r = await client.post(f"{base}/api/user", json=body, headers=headers)
+    if r.status_code >= 400:
+        logger.error("create service user failed: %s %s", r.status_code, r.text[:400])
+        raise RuntimeError(f"Create user failed: {r.status_code} {r.text[:300]}")
+    user_data = r.json() if r.content else {}
+    final_username = (user_data or {}).get("username") or username
+
+    try:
+        r2 = await client.get(f"{base}/api/user/{final_username}", headers=headers)
+        if r2.status_code < 400:
+            fresh = r2.json()
+            if isinstance(fresh, dict):
+                user_data = {**(user_data or {}), **fresh}
+    except Exception as e:
+        logger.warning("Could not refresh user after create: %s", e)
+
+    sub = _extract_subscription_url(user_data or {}, base)
+    if not sub:
+        for path in (
+            f"{base}/api/user/{final_username}/subscription",
+            f"{base}/api/user/{final_username}/sub",
+        ):
+            try:
+                r3 = await client.get(path, headers=headers)
+                if r3.status_code < 400:
+                    try:
+                        j = r3.json()
+                        sub = _extract_subscription_url(j if isinstance(j, dict) else {}, base)
+                    except Exception:
+                        text = (r3.text or "").strip()
+                        if text.startswith("http"):
+                            sub = text.split()[0]
+                    if sub:
+                        break
+            except Exception:
+                pass
+
+    return {
+        "username": final_username,
+        "subscription_url": sub or "",
+        "raw": user_data or {},
+    }
+
+
+async def create_service_account(
+    *,
+    telegram_user_id: int,
+    order_id: int,
+    data_limit_gb: float,
+    expire_days: int,
+    service_name: str,
+    volume_label: str,
+    duration_label: str | None = None,
+    hwid_limit: int | None = None,
+) -> dict[str, str]:
+    """
+    ساخت اکانت سرویس خریداری‌شده روی پنل.
+    خروجی: username, subscription_url, message
+    """
+    if not config.is_panel_auto_enabled():
+        raise RuntimeError("Panel auto mode is not configured")
+
+    prefix = config.PASARGUARD_SERVICE_USERNAME_PREFIX or "svc_"
+    username = f"{prefix}{telegram_user_id}_{order_id}_{uuid4().hex[:5]}"
+    username = username[:64]
+    duration = duration_label or _format_days(expire_days)
+
+    async with httpx.AsyncClient(timeout=30.0, verify=True, follow_redirects=True) as client:
+        token = await _get_token(client)
+        created = await _create_user_on_panel(
+            client,
+            token,
+            username=username,
+            data_limit_gb=data_limit_gb,
+            expire_days=expire_days,
+            note=f"order#{order_id} telegram={telegram_user_id}",
+            group_specs=list(getattr(config, "PASARGUARD_SERVICE_GROUPS", None) or []),
+            hwid_limit=hwid_limit,
+        )
+
+    final_username = created["username"]
+    sub = created["subscription_url"]
+    message = build_service_message(
+        final_username,
+        sub or "—",
+        service_name=service_name,
+        duration=duration,
+        volume=volume_label,
+    )
+    if final_username and final_username not in message:
+        message = message.rstrip() + f"\n\n👤 نام کاربری سرویس : {final_username}"
+    if sub and sub not in message:
+        message = message.rstrip() + f"\n\n📎 لینک اتصال:\n{sub}"
+    elif not sub:
+        message = message.rstrip() + "\n\n⚠️ لینک اشتراک از پنل دریافت نشد."
+
+    return {
+        "username": final_username,
+        "subscription_url": sub or "",
+        "message": message,
+    }

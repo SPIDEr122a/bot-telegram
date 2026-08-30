@@ -908,23 +908,20 @@ async def free_test_handler(message: Message, state: FSMContext):
                 pass
 
             sub_url = (result.get("subscription_url") or "").strip()
-            # اگر لینک ساب داریم، QR همان کاربر را هم می‌فرستیم
+            # متن + QR در یک پیام (عکس با کپشن) — نه جداگانه
             if sub_url:
                 try:
                     from aiogram.types import BufferedInputFile
 
                     qr_bytes = pg_panel.make_qr_png(sub_url)
+                    caption = result["message"]
+                    if len(caption) > 1024:
+                        caption = caption[:1000].rstrip() + "…"
                     await message.answer_photo(
                         BufferedInputFile(qr_bytes, filename="qr.png"),
-                        caption=result["message"][:1024],
+                        caption=caption,
                         reply_markup=main_menu_kb(user_id),
                     )
-                    # اگر متن از حد کپشن بیشتر بود، باقی‌اش را جدا می‌فرستیم
-                    if len(result["message"]) > 1024:
-                        await message.answer(
-                            result["message"][1024:],
-                            disable_web_page_preview=True,
-                        )
                 except Exception as qr_err:
                     logging.warning(f"QR send failed, fallback to text: {qr_err}")
                     await message.answer(
@@ -1922,6 +1919,121 @@ async def add_multi_price(message: Message, state: FSMContext):
 
 
 # ---------- Admin handlers ----------
+async def _parse_order_panel_spec(order) -> dict:
+    """از سفارش، مشخصات ساخت روی پنل را استخراج می‌کند."""
+    plan_name = str(order["plan_name"] or "")
+    is_gaming = plan_name.startswith("🎮") or "گیمینگ" in plan_name
+
+    if is_gaming:
+        plan = await db.get_gaming_plan(order["plan_id"])
+        volume_gb = float(plan["volume_gb"]) if plan else 10.0
+        expire_days = int(getattr(config, "PASARGUARD_GAMING_EXPIRE_DAYS", 30) or 30)
+        users = 1
+        vol_num = int(volume_gb) if volume_gb == int(volume_gb) else volume_gb
+        volume_label = f"{vol_num} گیگابایت"
+        # مثال: تک کاربره 👤 | 20 گیگابایت
+        service_name = f"تک کاربره 👤 | {volume_label}"
+        return {
+            "data_limit_gb": volume_gb,
+            "expire_days": expire_days,
+            "service_name": service_name,
+            "volume_label": volume_label,
+            "duration_label": f"{expire_days} روزه",
+            "hwid_limit": users,
+        }
+
+    plan = await db.get_multi_plan(order["plan_id"])
+    label = (plan["label"] if plan else plan_name) or ""
+    # برای پارس: فاصله و نیم‌فاصله را یکدست می‌کنیم
+    label_norm = label.replace("‌", " ").replace("，", ",").replace("،", ",")
+    label_l = label_norm.replace(" ", "").lower()
+
+    users = 2 if ("دوکاربر" in label_l or "2کاربر" in label_l) else 1
+
+    expire_days = int(getattr(config, "PASARGUARD_MULTI_EXPIRE_DAYS", 30) or 30)
+    if "سه‌ماه" in label_l or "3ماه" in label_l or "سهماه" in label_l:
+        expire_days = 90
+    elif "دوم‌ماه" in label_l or "دوماه" in label_l or "2ماه" in label_l:
+        expire_days = 60
+    elif "یک‌ماه" in label_l or "یکماه" in label_l or "1ماه" in label_l:
+        expire_days = 30
+
+    # حجم را از لیبل می‌خوانیم: GB 20 / 20GB / 20 گیگ / نامحدود
+    import re
+
+    data_limit_gb = 0.0
+    volume_label = "نامحدود"
+    if "نامحدود" in label or "unlimited" in label_l:
+        data_limit_gb = 0.0
+        volume_label = "نامحدود"
+    else:
+        m = re.search(r"(?:gb|گیگ(?:ابایت)?)\s*([0-9]+(?:\.[0-9]+)?)", label_norm, re.I)
+        if not m:
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:gb|گیگ(?:ابایت)?)", label_norm, re.I)
+        if m:
+            data_limit_gb = float(m.group(1))
+            vol_num = int(data_limit_gb) if data_limit_gb == int(data_limit_gb) else data_limit_gb
+            volume_label = f"{vol_num} گیگابایت"
+        else:
+            # اگر عدد تنها با GB نبود، آخرین عدد معقول را امتحان نکن — نامحدود نده مگر صریح
+            logging.warning(f"Could not parse volume from multi plan label: {label!r}")
+
+    user_title = "دو کاربره 👤" if users == 2 else "تک کاربره 👤"
+    service_name = f"{user_title} | {volume_label}"
+
+    return {
+        "data_limit_gb": data_limit_gb,
+        "expire_days": expire_days,
+        "service_name": service_name,
+        "volume_label": volume_label,
+        "duration_label": f"{expire_days} روزه",
+        "hwid_limit": users,
+    }
+
+
+async def _process_referral_commission(order, order_id: int) -> None:
+    referral = await db.get_referral_by_referred(order["user_id"])
+    if not referral:
+        return
+    if not referral["converted"]:
+        await db.mark_referral_converted(order["user_id"])
+    referrer_id = referral["referrer_id"]
+    if order["price"] and order["price"] > 0:
+        commission_percent = await db.get_referral_commission_percent()
+        commission_amount = int(order["price"] * commission_percent / 100)
+        if commission_amount > 0:
+            await db.add_wallet_balance(referrer_id, commission_amount)
+            await db.add_referral_commission(referrer_id, order["user_id"], order_id, commission_amount)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"💸 یکی از دوستانی که دعوت کردید خرید کرد!\n"
+                    f"مبلغ {commission_amount:,} تومان ({commission_percent}٪ از خریدش) به کیف پول شما اضافه شد. 🎉",
+                )
+            except Exception as e:
+                logging.warning(f"Could not notify referrer {referrer_id} about commission: {e}")
+
+
+async def _send_service_to_user(user_id: int, text: str, subscription_url: str = "") -> None:
+    """متن سرویس + QR را در یک پیام (عکس با کپشن) می‌فرستد — نه جدا."""
+    if subscription_url:
+        try:
+            import panel as pg_panel
+            from aiogram.types import BufferedInputFile
+
+            qr_bytes = pg_panel.make_qr_png(subscription_url)
+            caption = text if len(text) <= 1024 else text[:1000].rstrip() + "…"
+            await bot.send_photo(
+                user_id,
+                photo=BufferedInputFile(qr_bytes, filename="qr.png"),
+                caption=caption,
+            )
+            return
+        except Exception as e:
+            logging.warning(f"QR send for service failed: {e}")
+    await bot.send_message(user_id, text, disable_web_page_preview=True)
+
+
 @dp.callback_query(F.data.startswith("approve:"))
 async def admin_approve(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in config.ADMIN_IDS:
@@ -1934,15 +2046,69 @@ async def admin_approve(callback: CallbackQuery, state: FSMContext):
         await callback.answer("سفارش پیدا نشد.", show_alert=True)
         return
 
+    if order["status"] == "delivered":
+        await callback.answer("این سفارش قبلاً تحویل داده شده.", show_alert=True)
+        return
+
     await db.set_order_status(order_id, "approved")
+    await callback.answer()
+
+    # ---- ساخت خودکار روی پنل ----
+    if config.is_panel_auto_enabled():
+        wait = await callback.message.answer(f"⏳ در حال ساخت سرویس سفارش #{order_id} روی پنل...")
+        try:
+            import panel as pg_panel
+
+            spec = await _parse_order_panel_spec(order)
+            result = await pg_panel.create_service_account(
+                telegram_user_id=order["user_id"],
+                order_id=order_id,
+                data_limit_gb=spec["data_limit_gb"],
+                expire_days=spec["expire_days"],
+                service_name=spec["service_name"],
+                volume_label=spec["volume_label"],
+                duration_label=spec.get("duration_label"),
+                hwid_limit=spec.get("hwid_limit"),
+            )
+            await db.deliver_order(order_id, result["message"])
+            await _send_service_to_user(
+                order["user_id"],
+                result["message"],
+                result.get("subscription_url") or "",
+            )
+            try:
+                await wait.edit_text(
+                    f"✅ سفارش #{order_id} ساخته و برای مشتری ارسال شد.\n🔑 {result['username']}"
+                )
+            except Exception:
+                await callback.message.answer(
+                    f"✅ سفارش #{order_id} ساخته و برای مشتری ارسال شد.\n🔑 {result['username']}"
+                )
+            await _process_referral_commission(order, order_id)
+        except Exception as e:
+            logging.exception("Auto service create failed")
+            try:
+                await wait.edit_text(
+                    f"⚠️ ساخت خودکار سفارش #{order_id} خطا داد:\n<code>{e}</code>\n\n"
+                    f"می‌توانید اطلاعات سرویس را دستی بفرستید.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                await callback.message.answer(
+                    f"⚠️ ساخت خودکار خطا داد: <code>{e}</code>\nاطلاعات را دستی بفرستید.",
+                    parse_mode="HTML",
+                )
+            await state.update_data(order_id=order_id)
+            await state.set_state(AdminStates.waiting_for_panel_info)
+        return
+
+    # ---- حالت دستی ----
     await state.update_data(order_id=order_id)
     await state.set_state(AdminStates.waiting_for_panel_info)
-
     await callback.message.answer(
         f"✅ سفارش #{order_id} تأیید شد.\n"
         f"حالا لطفاً اطلاعات سرویس (کانفیگ/یوزر/پس/لینک و ...) رو برای ارسال به مشتری بفرستید:"
     )
-    await callback.answer()
 
 
 @dp.message(AdminStates.waiting_for_panel_info)
@@ -1969,27 +2135,7 @@ async def admin_send_panel_info(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ ارسال به کاربر ناموفق بود: {e}")
 
-    # رفرال دائمی پورسانتی: به‌ازای هر خرید موفق (تحویل‌شده) کاربری که با لینک یه نفر دیگه وارد شده،
-    # درصدی از مبلغ خرید به‌صورت نقدی به کیف پول دعوت‌کننده اضافه میشه - این کار به تعداد نامحدود تکرار میشه
-    referral = await db.get_referral_by_referred(order["user_id"])
-    if referral:
-        if not referral["converted"]:
-            await db.mark_referral_converted(order["user_id"])
-        referrer_id = referral["referrer_id"]
-        if order["price"] and order["price"] > 0:
-            commission_percent = await db.get_referral_commission_percent()
-            commission_amount = int(order["price"] * commission_percent / 100)
-            if commission_amount > 0:
-                await db.add_wallet_balance(referrer_id, commission_amount)
-                await db.add_referral_commission(referrer_id, order["user_id"], order_id, commission_amount)
-                try:
-                    await bot.send_message(
-                        referrer_id,
-                        f"💸 یکی از دوستانی که دعوت کردید خرید کرد!\n"
-                        f"مبلغ {commission_amount:,} تومان ({commission_percent}٪ از خریدش) به کیف پول شما اضافه شد. 🎉",
-                    )
-                except Exception as e:
-                    logging.warning(f"Could not notify referrer {referrer_id} about commission: {e}")
+    await _process_referral_commission(order, order_id)
 
 
 @dp.callback_query(F.data.startswith("reject:"))

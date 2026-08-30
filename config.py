@@ -101,9 +101,47 @@ PASARGUARD_TEST_MESSAGE = os.getenv(
 
 
 def is_panel_auto_enabled() -> bool:
-    """آیا ساخت خودکار تست از پنل فعال است؟"""
+    """آیا ساخت خودکار روی پنل فعال است؟ (تست و خرید سرویس)"""
     if not PASARGUARD_BASE_URL:
         return False
     if PASARGUARD_API_KEY:
         return True
     return bool(PASARGUARD_USERNAME and PASARGUARD_PASSWORD)
+
+
+# ---------- سرویس خریداری‌شده (بعد از تأیید رسید) ----------
+# گروه‌های سرویس پولی — اگر خالی باشد از PASARGUARD_TEST_GROUPS استفاده می‌شود
+_raw_svc_groups = os.getenv("PASARGUARD_SERVICE_GROUPS", "").strip()
+PASARGUARD_SERVICE_GROUPS = (
+    [x.strip() for x in _raw_svc_groups.split(",") if x.strip()]
+    if _raw_svc_groups
+    else list(PASARGUARD_TEST_GROUPS)
+)
+
+PASARGUARD_SERVICE_USERNAME_PREFIX = os.getenv("PASARGUARD_SERVICE_USERNAME_PREFIX", "svc_")
+PASARGUARD_SERVICE_LOCATION_NAME = os.getenv(
+    "PASARGUARD_SERVICE_LOCATION_NAME",
+    os.getenv("PASARGUARD_TEST_LOCATION_NAME", "مولتی لوکیشن نیم بها"),
+)
+
+# مدت پیش‌فرض گیمینگ (روز) — پلن گیمینگ فقط حجم دارد
+PASARGUARD_GAMING_EXPIRE_DAYS = int(os.getenv("PASARGUARD_GAMING_EXPIRE_DAYS", "30"))
+# اگر از لیبل مولتی مدت استخراج نشد
+PASARGUARD_MULTI_EXPIRE_DAYS = int(os.getenv("PASARGUARD_MULTI_EXPIRE_DAYS", "30"))
+
+# قالب پیام تحویل سرویس خریداری‌شده
+# {username} {service_name} {location} {duration} {volume} {subscription_url}
+PASARGUARD_SERVICE_MESSAGE = os.getenv(
+    "PASARGUARD_SERVICE_MESSAGE",
+    (
+        "✅ سرویس با موفقیت ایجاد شد\n\n"
+        "👤 نام کاربری سرویس : {username}\n"
+        "🚀 نام سرویس: {service_name}\n"
+        "🌐 لوکیشن: {location}\n"
+        "⏳ مدت زمان: {duration}\n"
+        "📊 حجم سرویس: {volume}\n\n"
+        "لینک اتصال:\n"
+        "{subscription_url}\n\n"
+        "🧑‍🦯 شما میتوانید شیوه اتصال را با فشردن دکمه زیر و انتخاب سیستم عامل خود را دریافت کنید"
+    ),
+)
