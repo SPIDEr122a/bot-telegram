@@ -62,6 +62,30 @@ async def init_db():
             )
             """
         )
+        # دسته‌های تعرفه سفارشی (مثل «اختلالات شدید»)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tariff_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                active INTEGER DEFAULT 1,
+                created_at TEXT
+            )
+            """
+        )
+        # پلن‌های داخل هر دسته سفارشی
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tariff_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                active INTEGER DEFAULT 1,
+                FOREIGN KEY (category_id) REFERENCES tariff_categories(id)
+            )
+            """
+        )
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -393,6 +417,12 @@ async def add_gaming_plan(volume_gb: int, price: int):
         await db.commit()
 
 
+async def delete_gaming_plan(plan_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM gaming_plans WHERE id = ?", (plan_id,))
+        await db.commit()
+
+
 # ---------- Multi-location plans (تعرفه سرویس مولتی لوکیشن) ----------
 async def get_multi_plans(active_only: bool = True):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -427,6 +457,109 @@ async def toggle_multi_active(plan_id: int):
 async def add_multi_plan(label: str, price: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO multi_plans (label, price, active) VALUES (?, ?, 1)", (label, price))
+        await db.commit()
+
+
+async def delete_multi_plan(plan_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM multi_plans WHERE id = ?", (plan_id,))
+        await db.commit()
+
+
+# ---------- Custom tariff categories (دسته‌های تعرفه سفارشی) ----------
+async def get_tariff_categories(active_only: bool = True):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM tariff_categories"
+        if active_only:
+            query += " WHERE active = 1"
+        query += " ORDER BY id ASC"
+        cursor = await db.execute(query)
+        return await cursor.fetchall()
+
+
+async def get_tariff_category(category_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM tariff_categories WHERE id = ?", (category_id,))
+        return await cursor.fetchone()
+
+
+async def add_tariff_category(name: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO tariff_categories (name, active, created_at) VALUES (?, 1, ?)",
+            (name, datetime.now().isoformat()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def toggle_tariff_category(category_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tariff_categories SET active = 1 - active WHERE id = ?", (category_id,)
+        )
+        await db.commit()
+
+
+async def delete_tariff_category(category_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM tariff_plans WHERE category_id = ?", (category_id,))
+        await db.execute("DELETE FROM tariff_categories WHERE id = ?", (category_id,))
+        await db.commit()
+
+
+async def rename_tariff_category(category_id: int, name: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tariff_categories SET name = ? WHERE id = ?", (name, category_id))
+        await db.commit()
+
+
+async def get_tariff_plans(category_id: int, active_only: bool = True):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM tariff_plans WHERE category_id = ?"
+        params: list = [category_id]
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY id ASC"
+        cursor = await db.execute(query, params)
+        return await cursor.fetchall()
+
+
+async def get_tariff_plan(plan_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM tariff_plans WHERE id = ?", (plan_id,))
+        return await cursor.fetchone()
+
+
+async def add_tariff_plan(category_id: int, label: str, price: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO tariff_plans (category_id, label, price, active) VALUES (?, ?, ?, 1)",
+            (category_id, label, price),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def update_tariff_plan_price(plan_id: int, price: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tariff_plans SET price = ? WHERE id = ?", (price, plan_id))
+        await db.commit()
+
+
+async def toggle_tariff_plan(plan_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tariff_plans SET active = 1 - active WHERE id = ?", (plan_id,))
+        await db.commit()
+
+
+async def delete_tariff_plan(plan_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM tariff_plans WHERE id = ?", (plan_id,))
         await db.commit()
 
 

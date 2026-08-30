@@ -163,6 +163,10 @@ class AdminStates(StatesGroup):
     adding_gaming_price = State()
     adding_multi_label = State()
     adding_multi_price = State()
+    adding_tariff_category_name = State()
+    adding_tariff_plan_label = State()
+    adding_tariff_plan_price = State()
+    editing_tariff_plan_price = State()
     editing_welcome_message = State()
     editing_referral_percent = State()
     editing_rules_text = State()
@@ -192,12 +196,35 @@ def back_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
-def services_kb() -> InlineKeyboardMarkup:
+async def services_kb() -> InlineKeyboardMarkup:
+    """منوی خرید: گیمینگ + مولتی + دسته‌های سفارشی فعال که حداقل یک پلن فعال دارند."""
     rows = [
         [InlineKeyboardButton(text="🎮 سرویس گیمینگ", callback_data="svc:gaming")],
         [InlineKeyboardButton(text="🌍 سرویس مولتی لوکیشن (وبگردی)", callback_data="svc:multi")],
-        [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
     ]
+    cats = await db.get_tariff_categories(active_only=True)
+    for c in cats:
+        plans = await db.get_tariff_plans(c["id"], active_only=True)
+        if plans:
+            rows.append(
+                [InlineKeyboardButton(text=f"📦 {c['name']}", callback_data=f"svc:cat:{c['id']}")]
+            )
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def custom_plans_kb(plans, category_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for p in plans:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{p['label']} - {p['price']:,} تومان",
+                    callback_data=f"cplan:{p['id']}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -390,7 +417,7 @@ async def show_services(message: Message, state: FSMContext):
     if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
         await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
         return
-    await message.answer("🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:", reply_markup=services_kb())
+    await message.answer("🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:", reply_markup=await services_kb())
 
 
 @dp.callback_query(F.data == "back:menu")
@@ -405,7 +432,10 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "back:services")
 async def back_to_services(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:", reply_markup=services_kb())
+    await callback.message.edit_text(
+        "🛍 لطفاً نوع سرویس مورد نظر رو انتخاب کنید:",
+        reply_markup=await services_kb(),
+    )
     await callback.answer()
 
 
@@ -485,6 +515,51 @@ async def choose_gaming_plan(callback: CallbackQuery, state: FSMContext):
         price=plan["price"],
     )
 
+    await state.clear()
+    order = await db.get_order(order_id)
+    await callback.message.edit_text(
+        order_summary_text(order), parse_mode="HTML", reply_markup=await build_order_summary_kb(order)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("svc:cat:"))
+async def choose_custom_category(callback: CallbackQuery, state: FSMContext):
+    cat_id = int(callback.data.split(":")[2])
+    cat = await db.get_tariff_category(cat_id)
+    if not cat or not cat["active"]:
+        await callback.answer("این دسته در دسترس نیست.", show_alert=True)
+        return
+    plans = await db.get_tariff_plans(cat_id, active_only=True)
+    if not plans:
+        await callback.answer("در حال حاضر تعرفه‌ای ثبت نشده.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"📦 <b>{cat['name']}</b>\nتعرفه مورد نظر را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=custom_plans_kb(plans, cat_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cplan:"))
+async def choose_custom_plan(callback: CallbackQuery, state: FSMContext):
+    plan_id = int(callback.data.split(":")[1])
+    plan = await db.get_tariff_plan(plan_id)
+    if not plan or not plan["active"]:
+        await callback.answer("این تعرفه دیگر موجود نیست.", show_alert=True)
+        return
+    cat = await db.get_tariff_category(plan["category_id"])
+    cat_name = cat["name"] if cat else "سرویس"
+    plan_name = f"📦 {cat_name} - {plan['label']}"
+    order_id = await db.create_order(
+        user_id=callback.from_user.id,
+        username=callback.from_user.username or "",
+        full_name=callback.from_user.full_name,
+        plan_id=plan_id,
+        plan_name=plan_name,
+        price=plan["price"],
+    )
     await state.clear()
     order = await db.get_order(order_id)
     await callback.message.edit_text(
@@ -1343,8 +1418,7 @@ async def invite_handler(message: Message, state: FSMContext):
 def admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎮 تعرفه‌های گیمینگ", callback_data="admintariff:gaming")],
-            [InlineKeyboardButton(text="🌍 تعرفه‌های مولتی لوکیشن", callback_data="admintariff:multi")],
+            [InlineKeyboardButton(text="📋 تعرفه‌ها", callback_data="admintariff:menu")],
             [InlineKeyboardButton(text="✉️ پیام خوش‌آمدگویی", callback_data="adminwelcome")],
             [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules")],
             [InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons")],
@@ -1355,25 +1429,101 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     )
 
 
+async def tariffs_menu_kb() -> InlineKeyboardMarkup:
+    """زیرمنوی تعرفه‌ها: افزودن دسته + گیمینگ + مولتی + دسته‌های سفارشی."""
+    rows = [
+        [InlineKeyboardButton(text="➕ افزودن دسته تعرفه (اسم دلخواه)", callback_data="admintariff:addcat")],
+        [InlineKeyboardButton(text="🎮 تعرفه‌های گیمینگ", callback_data="admintariff:gaming")],
+        [InlineKeyboardButton(text="🌍 تعرفه‌های مولتی لوکیشن", callback_data="admintariff:multi")],
+    ]
+    cats = await db.get_tariff_categories(active_only=False)
+    for c in cats:
+        status = "✅" if c["active"] else "🚫"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{status} 📦 {c['name']}",
+                    callback_data=f"admintariff:cat:{c['id']}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def custom_category_admin_kb(category_id: int) -> InlineKeyboardMarkup:
+    cat = await db.get_tariff_category(category_id)
+    plans = await db.get_tariff_plans(category_id, active_only=False)
+    rows = []
+    for p in plans:
+        status = "✅ فعال" if p["active"] else "🚫 غیرفعال"
+        label_short = (p["label"] or "")[:36]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{status} | {label_short} | {p['price']:,} ت",
+                    callback_data=f"tpriceedit:{p['id']}",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(text="💰 قیمت", callback_data=f"tpriceedit:{p['id']}"),
+                InlineKeyboardButton(
+                    text="⏸ غیرفعال" if p["active"] else "▶️ فعال",
+                    callback_data=f"ttoggle:{p['id']}",
+                ),
+                InlineKeyboardButton(text="🗑 حذف", callback_data=f"tdelete:{p['id']}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ افزودن پلن داخل این دسته", callback_data=f"tadd:{category_id}")])
+    if cat:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⏸ غیرفعال‌سازی کل دسته" if cat["active"] else "▶️ فعال‌سازی کل دسته",
+                    callback_data=f"tcattoggle:{category_id}",
+                )
+            ]
+        )
+        rows.append(
+            [InlineKeyboardButton(text="🗑 حذف کل دسته", callback_data=f"tcatdelete:{category_id}")]
+        )
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def gaming_admin_list_kb() -> InlineKeyboardMarkup:
     plans = await db.get_gaming_plans(active_only=False)
     rows = []
     for p in plans:
-        status = "✅" if p["active"] else "🚫"
+        status = "✅ فعال" if p["active"] else "🚫 غیرفعال"
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{status} {p['volume_gb']} گیگ - {p['price']:,} تومان",
+                    text=f"{status} | {p['volume_gb']} گیگ | {p['price']:,} ت",
+                    callback_data=f"gpriceedit:{p['id']}",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💰 قیمت",
                     callback_data=f"gpriceedit:{p['id']}",
                 ),
                 InlineKeyboardButton(
-                    text="غیرفعال" if p["active"] else "فعال",
+                    text="⏸ غیرفعال" if p["active"] else "▶️ فعال",
                     callback_data=f"gtoggle:{p['id']}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑 حذف",
+                    callback_data=f"gdelete:{p['id']}",
                 ),
             ]
         )
     rows.append([InlineKeyboardButton(text="➕ افزودن تعرفه جدید", callback_data="gadd")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1381,21 +1531,34 @@ async def multi_admin_list_kb() -> InlineKeyboardMarkup:
     plans = await db.get_multi_plans(active_only=False)
     rows = []
     for p in plans:
-        status = "✅" if p["active"] else "🚫"
+        status = "✅ فعال" if p["active"] else "🚫 غیرفعال"
+        label_short = (p["label"] or "")[:40]
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{status} {p['label']} - {p['price']:,} تومان",
+                    text=f"{status} | {label_short} | {p['price']:,} ت",
+                    callback_data=f"mpriceedit:{p['id']}",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💰 قیمت",
                     callback_data=f"mpriceedit:{p['id']}",
                 ),
                 InlineKeyboardButton(
-                    text="غیرفعال" if p["active"] else "فعال",
+                    text="⏸ غیرفعال" if p["active"] else "▶️ فعال",
                     callback_data=f"mtoggle:{p['id']}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑 حذف",
+                    callback_data=f"mdelete:{p['id']}",
                 ),
             ]
         )
     rows.append([InlineKeyboardButton(text="➕ افزودن تعرفه جدید", callback_data="madd")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1419,6 +1582,222 @@ async def admintariff_root(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(ADMIN_ROOT_TEXT, parse_mode="HTML", reply_markup=admin_menu_kb())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admintariff:menu")
+async def admintariff_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "📋 <b>مدیریت تعرفه‌ها</b>\n\n"
+        "• ➕ افزودن <b>دسته</b> با اسم دلخواه (مثلاً اختلالات شدید)\n"
+        "• داخل هر دسته پلن بگذار (مثلاً تک کاربره ، GB 30 ، یک ماهه)\n"
+        "• فعال / غیرفعال / حذف برای دسته و پلن‌ها\n"
+        "• بعد از تأیید رسید، ساخت خودکار روی پنل فعال است",
+        parse_mode="HTML",
+        reply_markup=await tariffs_menu_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admintariff:addcat")
+async def admintariff_add_category(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.adding_tariff_category_name)
+    await callback.message.answer(
+        "نام دسته تعرفه را بفرستید.\nمثال: <code>تعرفه برای اختلالات شدید</code>",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.adding_tariff_category_name)
+async def save_tariff_category_name(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    name = (message.text or "").strip()
+    if not name or len(name) < 2:
+        await message.answer("نام معتبر بفرستید (حداقل ۲ حرف).")
+        return
+    cat_id = await db.add_tariff_category(name)
+    await state.clear()
+    await message.answer(
+        f"✅ دسته «{name}» ساخته شد.\nحالا داخلش پلن اضافه کنید:",
+        reply_markup=await custom_category_admin_kb(cat_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("admintariff:cat:"))
+async def admintariff_open_category(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    cat_id = int(callback.data.split(":")[2])
+    cat = await db.get_tariff_category(cat_id)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        f"📦 <b>{cat['name']}</b>\n\n"
+        "پلن‌های این دسته را مدیریت کنید.\n"
+        "برای پلن جدید عنوان را مثل این بنویسید:\n"
+        "<code>تک کاربره ، GB 30 ، یک ماهه</code>",
+        parse_mode="HTML",
+        reply_markup=await custom_category_admin_kb(cat_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("tadd:"))
+async def start_add_tariff_plan(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    cat_id = int(callback.data.split(":")[1])
+    await state.update_data(tariff_category_id=cat_id)
+    await state.set_state(AdminStates.adding_tariff_plan_label)
+    await callback.message.answer(
+        "عنوان پلن را بفرستید.\nمثال: <code>تک کاربره ، GB 30 ، یک ماهه</code>",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.adding_tariff_plan_label)
+async def add_tariff_plan_label(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    label = (message.text or "").strip()
+    if not label:
+        await message.answer("عنوان معتبر بفرستید.")
+        return
+    await state.update_data(tariff_plan_label=label)
+    await state.set_state(AdminStates.adding_tariff_plan_price)
+    await message.answer("قیمت این پلن را به تومان بفرستید (فقط عدد):")
+
+
+@dp.message(AdminStates.adding_tariff_plan_price)
+async def add_tariff_plan_price(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    text = (message.text or "").replace(",", "").strip()
+    if not text.isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید.")
+        return
+    data = await state.get_data()
+    cat_id = data.get("tariff_category_id")
+    label = data.get("tariff_plan_label")
+    await db.add_tariff_plan(cat_id, label, int(text))
+    await state.clear()
+    await message.answer("✅ پلن اضافه شد.", reply_markup=await custom_category_admin_kb(cat_id))
+
+
+@dp.callback_query(F.data.startswith("tpriceedit:"))
+async def start_edit_tariff_plan_price(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    plan_id = int(callback.data.split(":")[1])
+    plan = await db.get_tariff_plan(plan_id)
+    if not plan:
+        await callback.answer("پلن پیدا نشد.", show_alert=True)
+        return
+    await state.update_data(tariff_plan_id=plan_id, tariff_category_id=plan["category_id"])
+    await state.set_state(AdminStates.editing_tariff_plan_price)
+    await callback.message.answer(f"قیمت جدید برای «{plan['label']}» را بفرستید:")
+    await callback.answer()
+
+
+@dp.message(AdminStates.editing_tariff_plan_price)
+async def save_tariff_plan_price(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    text = (message.text or "").replace(",", "").strip()
+    if not text.isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید.")
+        return
+    data = await state.get_data()
+    plan_id = data.get("tariff_plan_id")
+    cat_id = data.get("tariff_category_id")
+    await db.update_tariff_plan_price(plan_id, int(text))
+    await state.clear()
+    await message.answer("✅ قیمت بروزرسانی شد.", reply_markup=await custom_category_admin_kb(cat_id))
+
+
+@dp.callback_query(F.data.startswith("ttoggle:"))
+async def toggle_tariff_plan_cb(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    plan_id = int(callback.data.split(":")[1])
+    plan = await db.get_tariff_plan(plan_id)
+    if not plan:
+        await callback.answer("پلن پیدا نشد.", show_alert=True)
+        return
+    await db.toggle_tariff_plan(plan_id)
+    cat = await db.get_tariff_category(plan["category_id"])
+    await callback.message.edit_text(
+        f"📦 <b>{cat['name'] if cat else 'دسته'}</b>\nپلن‌ها:",
+        parse_mode="HTML",
+        reply_markup=await custom_category_admin_kb(plan["category_id"]),
+    )
+    await callback.answer("وضعیت پلن تغییر کرد.")
+
+
+@dp.callback_query(F.data.startswith("tdelete:"))
+async def delete_tariff_plan_cb(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    plan_id = int(callback.data.split(":")[1])
+    plan = await db.get_tariff_plan(plan_id)
+    if not plan:
+        await callback.answer("پلن پیدا نشد.", show_alert=True)
+        return
+    cat_id = plan["category_id"]
+    await db.delete_tariff_plan(plan_id)
+    cat = await db.get_tariff_category(cat_id)
+    await callback.message.edit_text(
+        f"📦 <b>{cat['name'] if cat else 'دسته'}</b>\nپلن‌ها:",
+        parse_mode="HTML",
+        reply_markup=await custom_category_admin_kb(cat_id),
+    )
+    await callback.answer("پلن حذف شد.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("tcattoggle:"))
+async def toggle_tariff_category_cb(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    cat_id = int(callback.data.split(":")[1])
+    await db.toggle_tariff_category(cat_id)
+    await callback.message.edit_text(
+        "📋 <b>مدیریت تعرفه‌ها</b>",
+        parse_mode="HTML",
+        reply_markup=await tariffs_menu_kb(),
+    )
+    await callback.answer("وضعیت دسته تغییر کرد.")
+
+
+@dp.callback_query(F.data.startswith("tcatdelete:"))
+async def delete_tariff_category_cb(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    cat_id = int(callback.data.split(":")[1])
+    await db.delete_tariff_category(cat_id)
+    await callback.message.edit_text(
+        "📋 <b>مدیریت تعرفه‌ها</b>",
+        parse_mode="HTML",
+        reply_markup=await tariffs_menu_kb(),
+    )
+    await callback.answer("دسته و پلن‌هایش حذف شدند.", show_alert=True)
 
 
 back_to_admin_root_kb = InlineKeyboardMarkup(
@@ -1740,13 +2119,31 @@ async def save_wallet_bonus_percent(message: Message, state: FSMContext):
     await message.answer("✅ درصد هدیه با موفقیت بروزرسانی شد.", reply_markup=wallet_bonus_kb())
 
 
+GAMING_TARIFF_TEXT = (
+    "🎮 <b>تعرفه‌های سرویس گیمینگ</b>\n\n"
+    "• ➕ افزودن تعرفه جدید\n"
+    "• ⏸ غیرفعال / ▶️ فعال (غیرفعال برای مشتری دیده نمی‌شود)\n"
+    "• 💰 تغییر قیمت · 🗑 حذف"
+)
+
+MULTI_TARIFF_TEXT = (
+    "🌍 <b>تعرفه‌های سرویس مولتی لوکیشن</b>\n\n"
+    "• ➕ افزودن تعرفه جدید\n"
+    "• ⏸ غیرفعال / ▶️ فعال (غیرفعال برای مشتری دیده نمی‌شود)\n"
+    "• 💰 تغییر قیمت · 🗑 حذف\n\n"
+    "برای عنوان جدید مثلاً بنویس:\n"
+    "<code>تک کاربره ، GB 20 ، یک ماهه</code>"
+)
+
+
 @dp.callback_query(F.data == "admintariff:gaming")
 async def admintariff_gaming(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
+    await state.clear()
     await callback.message.edit_text(
-        "🎮 <b>تعرفه‌های سرویس گیمینگ</b>\nروی هر تعرفه بزنید تا قیمتش رو تغییر بدید، یا فعال/غیرفعالش کنید:",
+        GAMING_TARIFF_TEXT,
         parse_mode="HTML",
         reply_markup=await gaming_admin_list_kb(),
     )
@@ -1758,8 +2155,9 @@ async def admintariff_multi(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in config.ADMIN_IDS:
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
+    await state.clear()
     await callback.message.edit_text(
-        "🌍 <b>تعرفه‌های سرویس مولتی لوکیشن</b>\nروی هر تعرفه بزنید تا قیمتش رو تغییر بدید، یا فعال/غیرفعالش کنید:",
+        MULTI_TARIFF_TEXT,
         parse_mode="HTML",
         reply_markup=await multi_admin_list_kb(),
     )
@@ -1773,7 +2171,14 @@ async def toggle_gaming(callback: CallbackQuery, state: FSMContext):
         return
     plan_id = int(callback.data.split(":")[1])
     await db.toggle_gaming_active(plan_id)
-    await callback.message.edit_reply_markup(reply_markup=await gaming_admin_list_kb())
+    try:
+        await callback.message.edit_text(
+            GAMING_TARIFF_TEXT,
+            parse_mode="HTML",
+            reply_markup=await gaming_admin_list_kb(),
+        )
+    except Exception:
+        await callback.message.edit_reply_markup(reply_markup=await gaming_admin_list_kb())
     await callback.answer("وضعیت تعرفه تغییر کرد.")
 
 
@@ -1784,8 +2189,59 @@ async def toggle_multi(callback: CallbackQuery, state: FSMContext):
         return
     plan_id = int(callback.data.split(":")[1])
     await db.toggle_multi_active(plan_id)
-    await callback.message.edit_reply_markup(reply_markup=await multi_admin_list_kb())
+    try:
+        await callback.message.edit_text(
+            MULTI_TARIFF_TEXT,
+            parse_mode="HTML",
+            reply_markup=await multi_admin_list_kb(),
+        )
+    except Exception:
+        await callback.message.edit_reply_markup(reply_markup=await multi_admin_list_kb())
     await callback.answer("وضعیت تعرفه تغییر کرد.")
+
+
+@dp.callback_query(F.data.startswith("gdelete:"))
+async def delete_gaming(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    plan_id = int(callback.data.split(":")[1])
+    plan = await db.get_gaming_plan(plan_id)
+    if not plan:
+        await callback.answer("تعرفه پیدا نشد.", show_alert=True)
+        return
+    await db.delete_gaming_plan(plan_id)
+    try:
+        await callback.message.edit_text(
+            GAMING_TARIFF_TEXT,
+            parse_mode="HTML",
+            reply_markup=await gaming_admin_list_kb(),
+        )
+    except Exception:
+        await callback.message.edit_reply_markup(reply_markup=await gaming_admin_list_kb())
+    await callback.answer(f"تعرفه {plan['volume_gb']} گیگ حذف شد.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("mdelete:"))
+async def delete_multi(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    plan_id = int(callback.data.split(":")[1])
+    plan = await db.get_multi_plan(plan_id)
+    if not plan:
+        await callback.answer("تعرفه پیدا نشد.", show_alert=True)
+        return
+    await db.delete_multi_plan(plan_id)
+    try:
+        await callback.message.edit_text(
+            MULTI_TARIFF_TEXT,
+            parse_mode="HTML",
+            reply_markup=await multi_admin_list_kb(),
+        )
+    except Exception:
+        await callback.message.edit_reply_markup(reply_markup=await multi_admin_list_kb())
+    await callback.answer("تعرفه حذف شد.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("gpriceedit:"))
@@ -1890,7 +2346,15 @@ async def start_add_multi(callback: CallbackQuery, state: FSMContext):
         await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
         return
     await state.set_state(AdminStates.adding_multi_label)
-    await callback.message.answer("عنوان تعرفه جدید رو بفرستید (مثال: سه کاربره نامحدود یک‌ماهه):")
+    await callback.message.answer(
+        "عنوان تعرفه جدید رو بفرستید.\n\n"
+        "مثال‌ها:\n"
+        "• <code>تک کاربره ، GB 20 ، یک ماهه</code>\n"
+        "• <code>تک کاربره ، GB 50 ، یک ماهه</code>\n"
+        "• <code>تک کاربره ، نامحدود ، یک ماهه</code>\n\n"
+        "حجم (GB ...) حتماً داخل عنوان باشد تا موقع ساخت روی پنل درست اعمال شود.",
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
@@ -1919,37 +2383,15 @@ async def add_multi_price(message: Message, state: FSMContext):
 
 
 # ---------- Admin handlers ----------
-async def _parse_order_panel_spec(order) -> dict:
-    """از سفارش، مشخصات ساخت روی پنل را استخراج می‌کند."""
-    plan_name = str(order["plan_name"] or "")
-    is_gaming = plan_name.startswith("🎮") or "گیمینگ" in plan_name
+def _spec_from_label(label: str) -> dict:
+    """پارس عنوان پلن (مولتی / سفارشی) به مشخصات پنل."""
+    import re
 
-    if is_gaming:
-        plan = await db.get_gaming_plan(order["plan_id"])
-        volume_gb = float(plan["volume_gb"]) if plan else 10.0
-        expire_days = int(getattr(config, "PASARGUARD_GAMING_EXPIRE_DAYS", 30) or 30)
-        users = 1
-        vol_num = int(volume_gb) if volume_gb == int(volume_gb) else volume_gb
-        volume_label = f"{vol_num} گیگابایت"
-        # مثال: تک کاربره 👤 | 20 گیگابایت
-        service_name = f"تک کاربره 👤 | {volume_label}"
-        return {
-            "data_limit_gb": volume_gb,
-            "expire_days": expire_days,
-            "service_name": service_name,
-            "volume_label": volume_label,
-            "duration_label": f"{expire_days} روزه",
-            "hwid_limit": users,
-        }
-
-    plan = await db.get_multi_plan(order["plan_id"])
-    label = (plan["label"] if plan else plan_name) or ""
-    # برای پارس: فاصله و نیم‌فاصله را یکدست می‌کنیم
+    label = label or ""
     label_norm = label.replace("‌", " ").replace("，", ",").replace("،", ",")
     label_l = label_norm.replace(" ", "").lower()
 
     users = 2 if ("دوکاربر" in label_l or "2کاربر" in label_l) else 1
-
     expire_days = int(getattr(config, "PASARGUARD_MULTI_EXPIRE_DAYS", 30) or 30)
     if "سه‌ماه" in label_l or "3ماه" in label_l or "سهماه" in label_l:
         expire_days = 90
@@ -1957,9 +2399,6 @@ async def _parse_order_panel_spec(order) -> dict:
         expire_days = 60
     elif "یک‌ماه" in label_l or "یکماه" in label_l or "1ماه" in label_l:
         expire_days = 30
-
-    # حجم را از لیبل می‌خوانیم: GB 20 / 20GB / 20 گیگ / نامحدود
-    import re
 
     data_limit_gb = 0.0
     volume_label = "نامحدود"
@@ -1975,20 +2414,50 @@ async def _parse_order_panel_spec(order) -> dict:
             vol_num = int(data_limit_gb) if data_limit_gb == int(data_limit_gb) else data_limit_gb
             volume_label = f"{vol_num} گیگابایت"
         else:
-            # اگر عدد تنها با GB نبود، آخرین عدد معقول را امتحان نکن — نامحدود نده مگر صریح
-            logging.warning(f"Could not parse volume from multi plan label: {label!r}")
+            logging.warning(f"Could not parse volume from plan label: {label!r}")
 
     user_title = "دو کاربره 👤" if users == 2 else "تک کاربره 👤"
-    service_name = f"{user_title} | {volume_label}"
-
     return {
         "data_limit_gb": data_limit_gb,
         "expire_days": expire_days,
-        "service_name": service_name,
+        "service_name": f"{user_title} | {volume_label}",
         "volume_label": volume_label,
         "duration_label": f"{expire_days} روزه",
         "hwid_limit": users,
     }
+
+
+async def _parse_order_panel_spec(order) -> dict:
+    """از سفارش، مشخصات ساخت روی پنل را استخراج می‌کند."""
+    plan_name = str(order["plan_name"] or "")
+    is_gaming = plan_name.startswith("🎮") or "گیمینگ" in plan_name
+
+    if is_gaming:
+        plan = await db.get_gaming_plan(order["plan_id"])
+        volume_gb = float(plan["volume_gb"]) if plan else 10.0
+        expire_days = int(getattr(config, "PASARGUARD_GAMING_EXPIRE_DAYS", 30) or 30)
+        users = 1
+        vol_num = int(volume_gb) if volume_gb == int(volume_gb) else volume_gb
+        volume_label = f"{vol_num} گیگابایت"
+        service_name = f"تک کاربره 👤 | {volume_label}"
+        return {
+            "data_limit_gb": volume_gb,
+            "expire_days": expire_days,
+            "service_name": service_name,
+            "volume_label": volume_label,
+            "duration_label": f"{expire_days} روزه",
+            "hwid_limit": users,
+        }
+
+    # دسته سفارشی: 📦 نام‌دسته - لیبل
+    if plan_name.startswith("📦"):
+        plan = await db.get_tariff_plan(order["plan_id"])
+        label = (plan["label"] if plan else plan_name.split(" - ", 1)[-1]) or plan_name
+        return _spec_from_label(label)
+
+    plan = await db.get_multi_plan(order["plan_id"])
+    label = (plan["label"] if plan else plan_name) or ""
+    return _spec_from_label(label)
 
 
 async def _process_referral_commission(order, order_id: int) -> None:
