@@ -1010,7 +1010,19 @@ async def free_test_handler(message: Message, state: FSMContext):
                     reply_markup=main_menu_kb(user_id),
                     disable_web_page_preview=True,
                 )
-            # نوتیف موفقیت به ادمین ارسال نمی‌شود (طبق درخواست)
+            # اطلاع به ادمین: آیدی کسی که تست گرفته
+            admin_text = (
+                f"🎁 تست رایگان گرفته شد\n"
+                f"👤 {message.from_user.full_name}\n"
+                f"🆔 آیدی عددی: <code>{user_id}</code>\n"
+                f"🔗 یوزرنیم: @{message.from_user.username or '-'}\n"
+                f"🔑 اکانت پنل: <code>{result.get('username') or '-'}</code>"
+            )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, admin_text, parse_mode="HTML")
+                except Exception as e:
+                    logging.warning(f"Could not notify admin {admin_id} about free test: {e}")
         except Exception as e:
             logging.exception("Auto free-test panel error")
             await db.set_free_test_status(user_id, "rejected")
