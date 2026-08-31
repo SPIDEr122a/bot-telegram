@@ -1143,23 +1143,15 @@ async def admin_reject_free_test(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- گردونه شانس ----------
-# جوایز: وزن‌ها احتمال نسبی هستند
-WHEEL_MAX_SPINS_PER_DAY = 3
-WHEEL_PRIZES = [
-    {"key": "wallet_10", "label": "۱۰٬۰۰۰ تومان کیف پول", "weight": 22, "type": "wallet", "amount": 10_000},
-    {"key": "wallet_20", "label": "۲۰٬۰۰۰ تومان کیف پول", "weight": 14, "type": "wallet", "amount": 20_000},
-    {"key": "config_1gb", "label": "کانفیگ ۱ گیگ (۳۰ روزه)", "weight": 16, "type": "config", "gb": 1.0, "days": 30},
-    {"key": "empty_1", "label": "پوچ 😅", "weight": 24, "type": "empty"},
-    {"key": "empty_2", "label": "پوچ 😅", "weight": 24, "type": "empty"},
-]
-
-
+# ---------- گردونه شانس (تنظیم از Variables: config.WHEEL_MAX_SPINS_PER_DAY و config.WHEEL_PRIZES) ----------
 def _pick_wheel_prize() -> dict:
     import random
 
-    weights = [p["weight"] for p in WHEEL_PRIZES]
-    return random.choices(WHEEL_PRIZES, weights=weights, k=1)[0]
+    prizes = config.WHEEL_PRIZES or []
+    if not prizes:
+        return {"key": "empty", "label": "پوچ 😅", "weight": 1, "type": "empty"}
+    weights = [max(1, int(p.get("weight") or 1)) for p in prizes]
+    return random.choices(prizes, weights=weights, k=1)[0]
 
 
 def wheel_spin_kb() -> InlineKeyboardMarkup:
@@ -1179,12 +1171,12 @@ async def wheel_entry(message: Message, state: FSMContext):
         return
 
     used = await db.count_wheel_spins_today(message.from_user.id)
-    left = max(0, WHEEL_MAX_SPINS_PER_DAY - used)
-    prize_lines = "\n".join(f"• {p['label']}" for p in WHEEL_PRIZES if p["type"] != "empty")
+    left = max(0, config.WHEEL_MAX_SPINS_PER_DAY - used)
+    prize_lines = "\n".join(f"• {p['label']}" for p in config.WHEEL_PRIZES if p["type"] != "empty")
     prize_lines += "\n• پوچ"
     await message.answer(
         f"🎰 <b>گردونه شانس</b>\n\n"
-        f"هر روز <b>{WHEEL_MAX_SPINS_PER_DAY}</b> شانس داری.\n"
+        f"هر روز <b>{config.WHEEL_MAX_SPINS_PER_DAY}</b> شانس داری.\n"
         f"امروز استفاده شده: <b>{used}</b> | باقی‌مانده: <b>{left}</b>\n\n"
         f"جوایز احتمالی:\n{prize_lines}",
         parse_mode="HTML",
@@ -1201,7 +1193,7 @@ async def wheel_spin(callback: CallbackQuery, state: FSMContext):
         return
 
     used = await db.count_wheel_spins_today(user_id)
-    if used >= WHEEL_MAX_SPINS_PER_DAY:
+    if used >= config.WHEEL_MAX_SPINS_PER_DAY:
         await callback.answer("امروز شانس‌هات تموم شده. فردا دوباره بیا!", show_alert=True)
         try:
             await callback.message.edit_reply_markup(reply_markup=back_menu_kb())
@@ -1212,7 +1204,7 @@ async def wheel_spin(callback: CallbackQuery, state: FSMContext):
     await callback.answer("🎰 در حال چرخش...")
     prize = _pick_wheel_prize()
     await db.record_wheel_spin(user_id, prize["key"], prize["label"])
-    left = max(0, WHEEL_MAX_SPINS_PER_DAY - (used + 1))
+    left = max(0, config.WHEEL_MAX_SPINS_PER_DAY - (used + 1))
 
     result_text = f"🎰 نتیجه گردونه:\n\n🎯 <b>{prize['label']}</b>\n\n"
 
@@ -1245,13 +1237,19 @@ async def wheel_spin(callback: CallbackQuery, state: FSMContext):
             try:
                 import panel as pg_panel
 
+                gb_val = float(prize.get("gb") or 0.5)
+                if gb_val < 1:
+                    vol_txt = f"{int(gb_val * 1024)} مگابایت"
+                else:
+                    vol_num = int(gb_val) if gb_val == int(gb_val) else gb_val
+                    vol_txt = f"{vol_num} گیگابایت"
                 result = await pg_panel.create_service_account(
                     telegram_user_id=user_id,
                     order_id=0,
-                    data_limit_gb=float(prize.get("gb") or 2.0),
+                    data_limit_gb=gb_val,
                     expire_days=int(prize.get("days") or 30),
-                    service_name=f"تک کاربره 👤 | {int(prize.get('gb') or 2)} گیگابایت",
-                    volume_label=f"{int(prize.get('gb') or 2)} گیگابایت",
+                    service_name=f"تک کاربره 👤 | {vol_txt}",
+                    volume_label=vol_txt,
                     duration_label=f"{int(prize.get('days') or 30)} روزه",
                     hwid_limit=1,
                 )

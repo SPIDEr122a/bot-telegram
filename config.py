@@ -145,3 +145,78 @@ PASARGUARD_SERVICE_MESSAGE = os.getenv(
         "🧑‍🦯 شما میتوانید شیوه اتصال را با فشردن دکمه زیر و انتخاب سیستم عامل خود را دریافت کنید"
     ),
 )
+
+
+# ---------- گردونه شانس ----------
+# تعداد شانس روزانه هر کاربر
+WHEEL_MAX_SPINS_PER_DAY = int(os.getenv("WHEEL_MAX_SPINS_PER_DAY", "3"))
+
+# جوایز — با ; از هم جدا شوند. فرمت هر جایزه:
+#   wallet|مبلغ_تومان|وزن
+#   config|حجم_گیگ|روز|وزن     (مثال 0.5 = ۵۰۰ مگ)
+#   empty|وزن
+# مثال پیش‌فرض:
+# WHEEL_PRIZES=wallet|10000|22;wallet|20000|14;config|0.5|30|16;empty|24;empty|24
+_DEFAULT_WHEEL = "wallet|10000|22;wallet|20000|14;config|0.5|30|16;empty|24;empty|24"
+
+
+def _parse_wheel_prizes(raw: str) -> list[dict]:
+    prizes: list[dict] = []
+    for i, part in enumerate((raw or "").split(";")):
+        part = part.strip()
+        if not part:
+            continue
+        bits = [b.strip() for b in part.split("|")]
+        kind = (bits[0] or "").lower()
+        try:
+            if kind == "wallet" and len(bits) >= 3:
+                amount = int(bits[1])
+                weight = int(bits[2])
+                prizes.append(
+                    {
+                        "key": f"wallet_{amount}_{i}",
+                        "label": f"{amount:,} تومان کیف پول".replace(",", "٬"),
+                        "weight": weight,
+                        "type": "wallet",
+                        "amount": amount,
+                    }
+                )
+            elif kind == "config" and len(bits) >= 4:
+                gb = float(bits[1])
+                days = int(bits[2])
+                weight = int(bits[3])
+                if gb < 1:
+                    mb = int(round(gb * 1024))
+                    if abs(gb * 1024 - 512) < 2:
+                        mb = 500
+                    vol = f"{mb} مگ"
+                else:
+                    vol = f"{int(gb) if gb == int(gb) else gb} گیگ"
+                prizes.append(
+                    {
+                        "key": f"config_{gb}_{days}_{i}",
+                        "label": f"کانفیگ {vol} ({days} روزه)",
+                        "weight": weight,
+                        "type": "config",
+                        "gb": gb,
+                        "days": days,
+                    }
+                )
+            elif kind == "empty" and len(bits) >= 2:
+                weight = int(bits[1])
+                prizes.append(
+                    {
+                        "key": f"empty_{i}",
+                        "label": "پوچ 😅",
+                        "weight": weight,
+                        "type": "empty",
+                    }
+                )
+        except (ValueError, IndexError):
+            continue
+    return prizes
+
+
+WHEEL_PRIZES = _parse_wheel_prizes(os.getenv("WHEEL_PRIZES", _DEFAULT_WHEEL))
+if not WHEEL_PRIZES:
+    WHEEL_PRIZES = _parse_wheel_prizes(_DEFAULT_WHEEL)
