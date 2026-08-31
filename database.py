@@ -174,21 +174,6 @@ async def init_db():
             )
             """
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS wheel_spins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                prize_key TEXT NOT NULL,
-                prize_label TEXT,
-                created_at TEXT NOT NULL,
-                spin_date TEXT NOT NULL
-            )
-            """
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wheel_spins_user_date ON wheel_spins(user_id, spin_date)"
-        )
         await db.commit()
 
         # مهاجرت: ستون payment_method به جدول orders (برای دیتابیس‌های قدیمی‌تر که این ستون رو ندارن)
@@ -940,27 +925,57 @@ async def deliver_free_test(user_id: int, panel_info: str) -> None:
         await db.commit()
 
 
-# ---------- گردونه شانس ----------
-def _today_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-async def count_wheel_spins_today(user_id: int) -> int:
+async def get_orders_report() -> dict:
+    """آمار کلی سفارش‌ها برای پنل ادمین."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM wheel_spins WHERE user_id = ? AND spin_date = ?",
-            (user_id, _today_str()),
-        )
-        row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        db.row_factory = aiosqlite.Row
 
+        async def _count(where: str = "", params=()):
+            q = "SELECT COUNT(*) AS c FROM orders"
+            if where:
+                q += " WHERE " + where
+            cur = await db.execute(q, params)
+            row = await cur.fetchone()
+            return int(row["c"] if row else 0)
 
-async def record_wheel_spin(user_id: int, prize_key: str, prize_label: str) -> None:
-    now = datetime.now()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO wheel_spins (user_id, prize_key, prize_label, created_at, spin_date)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, prize_key, prize_label, now.isoformat(), now.strftime("%Y-%m-%d")),
+        total = await _count()
+        delivered = await _count("status = 'delivered'")
+        pending = await _count("status IN ('pending', 'awaiting_receipt', 'approved')")
+        rejected = await _count("status = 'rejected'")
+
+        cur = await db.execute(
+            "SELECT COALESCE(SUM(price), 0) AS s FROM orders WHERE status = 'delivered'"
         )
-        await db.commit()
+        row = await cur.fetchone()
+        revenue = int(row["s"] if row else 0)
+
+        cur = await db.execute(
+            """SELECT COALESCE(SUM(price), 0) AS s FROM orders
+               WHERE status = 'delivered' AND date(created_at) = date('now', 'localtime')"""
+        )
+        row = await cur.fetchone()
+        revenue_today = int(row["s"] if row else 0)
+
+        cur = await db.execute(
+            """SELECT COUNT(*) AS c FROM orders
+               WHERE status = 'delivered' AND date(created_at) = date('now', 'localtime')"""
+        )
+        row = await cur.fetchone()
+        delivered_today = int(row["c"] if row else 0)
+
+        cur = await db.execute(
+            """SELECT id, user_id, full_name, username, plan_name, price, status, created_at
+               FROM orders ORDER BY id DESC LIMIT 15"""
+        )
+        recent = await cur.fetchall()
+
+        return {
+            "total": total,
+            "delivered": delivered,
+            "pending": pending,
+            "rejected": rejected,
+            "revenue": revenue,
+            "revenue_today": revenue_today,
+            "delivered_today": delivered_today,
+            "recent": recent,
+        }

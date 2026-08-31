@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from time import monotonic
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -175,15 +176,16 @@ class AdminStates(StatesGroup):
     adding_coupon_maxuses = State()
     editing_wallet_bonus_threshold = State()
     editing_wallet_bonus_percent = State()
+    waiting_for_backup_upload = State()
 
 
 # ---------- Keyboards ----------
 def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text="🛍 خرید سرویس"), KeyboardButton(text="🖥 سرویس‌های من")],
-        [KeyboardButton(text="🎁 تست رایگان"), KeyboardButton(text="🎰 گردونه شانس")],
-        [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="💬 پشتیبانی")],
-        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="📜 قوانین")],
+        [KeyboardButton(text="🎁 تست رایگان"), KeyboardButton(text="💰 کیف پول")],
+        [KeyboardButton(text="💬 پشتیبانی"), KeyboardButton(text="🤝 دعوت دوستان")],
+        [KeyboardButton(text="📜 قوانین")],
     ]
     if user_id is not None and user_id in config.ADMIN_IDS:
         keyboard.append([KeyboardButton(text="🛠 مدیریت ربات")])
@@ -1166,174 +1168,6 @@ async def admin_reject_free_test(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- گردونه شانس (تنظیم از Variables: config.WHEEL_MAX_SPINS_PER_DAY و config.WHEEL_PRIZES) ----------
-def _pick_wheel_prize() -> dict:
-    import random
-
-    prizes = config.WHEEL_PRIZES or []
-    if not prizes:
-        return {"key": "empty", "label": "پوچ 😅", "weight": 1, "type": "empty"}
-    weights = [max(1, int(p.get("weight") or 1)) for p in prizes]
-    return random.choices(prizes, weights=weights, k=1)[0]
-
-
-def wheel_spin_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎰 بچرخون!", callback_data="wheel:spin")],
-            [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
-        ]
-    )
-
-
-@dp.message(F.text == "🎰 گردونه شانس")
-async def wheel_entry(message: Message, state: FSMContext):
-    await state.clear()
-    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
-        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
-        return
-
-    used = await db.count_wheel_spins_today(message.from_user.id)
-    left = max(0, config.WHEEL_MAX_SPINS_PER_DAY - used)
-    prize_lines = "\n".join(f"• {p['label']}" for p in config.WHEEL_PRIZES if p["type"] != "empty")
-    prize_lines += "\n• پوچ"
-    await message.answer(
-        f"🎰 <b>گردونه شانس</b>\n\n"
-        f"هر روز <b>{config.WHEEL_MAX_SPINS_PER_DAY}</b> شانس داری.\n"
-        f"امروز استفاده شده: <b>{used}</b> | باقی‌مانده: <b>{left}</b>\n\n"
-        f"جوایز احتمالی:\n{prize_lines}",
-        parse_mode="HTML",
-        reply_markup=wheel_spin_kb() if left > 0 else back_menu_kb(),
-    )
-
-
-@dp.callback_query(F.data == "wheel:spin")
-async def wheel_spin(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    user_id = callback.from_user.id
-    if config.REQUIRED_CHANNELS and not await is_user_member(user_id):
-        await callback.answer("ابتدا عضو کانال شوید.", show_alert=True)
-        return
-
-    used = await db.count_wheel_spins_today(user_id)
-    if used >= config.WHEEL_MAX_SPINS_PER_DAY:
-        await callback.answer("امروز شانس‌هات تموم شده. فردا دوباره بیا!", show_alert=True)
-        try:
-            await callback.message.edit_reply_markup(reply_markup=back_menu_kb())
-        except Exception:
-            pass
-        return
-
-    await callback.answer("🎰 در حال چرخش...")
-    prize = _pick_wheel_prize()
-    await db.record_wheel_spin(user_id, prize["key"], prize["label"])
-    left = max(0, config.WHEEL_MAX_SPINS_PER_DAY - (used + 1))
-
-    result_text = f"🎰 نتیجه گردونه:\n\n🎯 <b>{prize['label']}</b>\n\n"
-
-    if prize["type"] == "empty":
-        result_text += "این بار شانس نیاوردی 😅 دوباره امتحان کن!"
-    elif prize["type"] == "wallet":
-        amount = int(prize["amount"])
-        await db.add_wallet_balance(user_id, amount)
-        bal = await db.get_wallet_balance(user_id)
-        result_text += f"✅ {amount:,} تومان به کیف پولت اضافه شد.\n💰 موجودی الان: <b>{bal:,} تومان</b>"
-    elif prize["type"] == "config":
-        if not config.is_panel_auto_enabled():
-            result_text += (
-                "✅ برنده‌ی کانفیگ شدی!\n"
-                "ساخت خودکار پنل خاموش است؛ ادمین به‌زودی برات ارسال می‌کند."
-            )
-            for admin_id in config.ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        f"🎰 برنده کانفیگ گردونه\n"
-                        f"👤 {callback.from_user.full_name}\n"
-                        f"🆔 <code>{user_id}</code>\n"
-                        f"📦 {prize['label']}",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-        else:
-            try:
-                import panel as pg_panel
-
-                gb_val = float(prize.get("gb") or 0.5)
-                if gb_val < 1:
-                    vol_txt = f"{int(gb_val * 1024)} مگابایت"
-                else:
-                    vol_num = int(gb_val) if gb_val == int(gb_val) else gb_val
-                    vol_txt = f"{vol_num} گیگابایت"
-                result = await pg_panel.create_service_account(
-                    telegram_user_id=user_id,
-                    order_id=0,
-                    data_limit_gb=gb_val,
-                    expire_days=int(prize.get("days") or 30),
-                    service_name=f"تک کاربره 👤 | {vol_txt}",
-                    volume_label=vol_txt,
-                    duration_label=f"{int(prize.get('days') or 30)} روزه",
-                    hwid_limit=1,
-                )
-                sub = (result.get("subscription_url") or "").strip()
-                msg = (
-                    f"🎰 نتیجه گردونه:\n\n🎯 <b>{prize['label']}</b>\n\n"
-                    f"{result['message']}"
-                )
-                if sub:
-                    try:
-                        from aiogram.types import BufferedInputFile
-
-                        qr = pg_panel.make_qr_png(sub)
-                        cap = msg if len(msg) <= 1024 else msg[:1000] + "…"
-                        await callback.message.answer_photo(
-                            BufferedInputFile(qr, filename="qr.png"),
-                            caption=cap,
-                        )
-                        result_text = ""  # already sent
-                    except Exception as e:
-                        logging.warning(f"Wheel QR failed: {e}")
-                        result_text = msg
-                else:
-                    result_text = msg
-            except Exception as e:
-                logging.exception("Wheel config create failed")
-                result_text += f"⚠️ ساخت کانفیگ خطا داد. ادمین مطلع شد.\n<code>{e}</code>"
-                for admin_id in config.ADMIN_IDS:
-                    try:
-                        await bot.send_message(
-                            admin_id,
-                            f"⚠️ خطا گردونه کانفیگ برای <code>{user_id}</code>:\n<code>{e}</code>",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
-
-    result_text = (result_text or "") + f"\n\nشانس باقی‌مانده امروز: <b>{left}</b>"
-    kb = wheel_spin_kb() if left > 0 else back_menu_kb()
-    if result_text.strip():
-        try:
-            await callback.message.answer(result_text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            await callback.message.answer(result_text, reply_markup=kb)
-
-    # نوتیف ادمین برای جوایز غیرپوچ
-    if prize["type"] != "empty":
-        for admin_id in config.ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"🎰 گردونه شانس\n"
-                    f"👤 {callback.from_user.full_name} (@{callback.from_user.username or '-'})\n"
-                    f"🆔 <code>{user_id}</code>\n"
-                    f"🎁 {prize['label']}",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
-
 @dp.message(F.text == "💰 کیف پول")
 async def wallet_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -1630,6 +1464,11 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 تعرفه‌ها", callback_data="admintariff:menu")],
+            [InlineKeyboardButton(text="📊 گزارش خریدها", callback_data="adminreports")],
+            [
+                InlineKeyboardButton(text="⬇️ دانلود بکاپ", callback_data="adminbackup:dl"),
+                InlineKeyboardButton(text="⬆️ آپلود بکاپ", callback_data="adminbackup:ul"),
+            ],
             [InlineKeyboardButton(text="✉️ پیام خوش‌آمدگویی", callback_data="adminwelcome")],
             [InlineKeyboardButton(text="📜 ویرایش قوانین", callback_data="adminrules")],
             [InlineKeyboardButton(text="🎟 کدهای تخفیف", callback_data="admincoupons")],
@@ -1793,6 +1632,170 @@ async def admintariff_root(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(ADMIN_ROOT_TEXT, parse_mode="HTML", reply_markup=admin_menu_kb())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "adminreports")
+async def admin_orders_report(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    await state.clear()
+    rep = await db.get_orders_report()
+    lines = [
+        "📊 <b>گزارش خریدها</b>\n",
+        f"📦 کل سفارش‌ها: <b>{rep['total']}</b>",
+        f"✅ تحویل‌شده: <b>{rep['delivered']}</b>",
+        f"⏳ در انتظار / در جریان: <b>{rep['pending']}</b>",
+        f"❌ رد‌شده: <b>{rep['rejected']}</b>",
+        f"💰 درآمد کل (تحویل‌شده): <b>{rep['revenue']:,}</b> تومان",
+        f"📅 امروز — تعداد: <b>{rep['delivered_today']}</b> | مبلغ: <b>{rep['revenue_today']:,}</b> تومان",
+        "\n<b>۱۵ سفارش اخیر:</b>",
+    ]
+    status_map = {
+        "awaiting_receipt": "⏳ رسید",
+        "pending": "🕐 بررسی",
+        "approved": "✅ تأیید",
+        "delivered": "📦 تحویل",
+        "rejected": "❌ رد",
+    }
+    for o in rep["recent"]:
+        st = status_map.get(o["status"], o["status"])
+        uname = f"@{o['username']}" if o["username"] else "-"
+        lines.append(
+            f"#{o['id']} | {st} | {o['price']:,} ت\n"
+            f"   {o['plan_name']}\n"
+            f"   👤 {o['full_name'] or '-'} ({uname}) | <code>{o['user_id']}</code>"
+        )
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3900] + "\n…"
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:root")]]
+        ),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adminbackup:dl")
+async def admin_backup_download(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    await state.clear()
+    path = config.DB_PATH
+    if not os.path.isfile(path):
+        await callback.answer("فایل دیتابیس پیدا نشد.", show_alert=True)
+        return
+    await callback.answer()
+    from datetime import datetime as _dt
+    from aiogram.types import FSInputFile
+
+    fname = f"bot_backup_{_dt.now().strftime('%Y%m%d_%H%M%S')}.db"
+    try:
+        await callback.message.answer_document(
+            FSInputFile(path, filename=fname),
+            caption=(
+                "⬇️ <b>بکاپ دیتابیس</b>\n"
+                "این فایل را قبل از ریست نگه دارید.\n"
+                "برای بازگردانی: مدیریت ربات → ⬆️ آپلود بکاپ"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await callback.message.answer(f"❌ ارسال بکاپ ناموفق بود: {e}")
+
+
+@dp.callback_query(F.data == "adminbackup:ul")
+async def admin_backup_upload_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("شما دسترسی ادمین ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_backup_upload)
+    await callback.message.answer(
+        "⬆️ <b>آپلود بکاپ</b>\n\n"
+        "فایل <code>.db</code> بکاپ را همین‌جا ارسال کنید.\n"
+        "⚠️ بعد از آپلود، داده‌های فعلی با بکاپ جایگزین می‌شوند.\n"
+        "برای انصراف /cancel بفرستید.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_backup_upload, F.document)
+async def admin_backup_upload_receive(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not (name.endswith(".db") or name.endswith(".sqlite") or name.endswith(".sqlite3")):
+        await message.answer("لطفاً فقط فایل دیتابیس (.db) ارسال کنید.")
+        return
+
+    import shutil
+    import tempfile
+
+    wait = await message.answer("⏳ در حال دریافت و جایگزینی بکاپ...")
+    try:
+        # دانلود در فایل موقت
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        tmp_path = tmp.name
+        tmp.close()
+        await bot.download(doc, destination=tmp_path)
+
+        # اعتبارسنجی sqlite
+        import sqlite3
+
+        conn = sqlite3.connect(tmp_path)
+        try:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {r[0] for r in cur.fetchall()}
+        finally:
+            conn.close()
+        if "orders" not in tables:
+            os.unlink(tmp_path)
+            await wait.edit_text("❌ این فایل بکاپ معتبر ربات نیست (جدول orders نیست).")
+            return
+
+        dest = config.DB_PATH
+        # بکاپ از فایل فعلی قبل از جایگزینی
+        if os.path.isfile(dest):
+            shutil.copy2(dest, dest + ".before_restore")
+        shutil.copy2(tmp_path, dest)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        # اطمینان از schema جدید روی بکاپ قدیمی
+        await db.init_db()
+        await state.clear()
+        await wait.edit_text(
+            "✅ بکاپ با موفقیت بازگردانی شد.\n"
+            "تعرفه‌ها، سفارش‌ها، کیف پول و بقیه داده‌ها برگشتند.\n"
+            "(یک کپی از دیتای قبلی با پسوند .before_restore نگه داشته شد.)",
+            reply_markup=admin_menu_kb(),
+        )
+    except Exception as e:
+        logging.exception("Backup restore failed")
+        await state.clear()
+        try:
+            await wait.edit_text(f"❌ خطا در بازگردانی بکاپ:\n<code>{e}</code>", parse_mode="HTML")
+        except Exception:
+            await message.answer(f"❌ خطا در بازگردانی بکاپ: {e}")
+
+
+@dp.message(AdminStates.waiting_for_backup_upload)
+async def admin_backup_upload_wrong(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    if (message.text or "").strip() in ("/cancel", "cancel", "انصراف"):
+        await state.clear()
+        await message.answer("آپلود بکاپ لغو شد.", reply_markup=admin_menu_kb())
+        return
+    await message.answer("لطفاً فایل .db بکاپ را به‌صورت Document بفرستید، یا /cancel برای انصراف.")
 
 
 @dp.callback_query(F.data == "admintariff:menu")
