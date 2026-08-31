@@ -335,10 +335,33 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
             if not existing:
                 added = await db.add_referral(referrer_id, message.from_user.id, message.from_user.username or "")
                 if added:
-                    try:
-                        await bot.send_message(referrer_id, "🎉 یک نفر با لینک دعوت شما وارد ربات شد!")
-                    except Exception as e:
-                        logging.warning(f"Could not notify referrer {referrer_id}: {e}")
+                    bonus = int(getattr(config, "REFERRAL_JOIN_BONUS", 30000) or 0)
+                    if bonus > 0:
+                        # برد–برد: هم دعوت‌کننده هم دعوت‌شونده
+                        await db.add_wallet_balance(referrer_id, bonus)
+                        await db.add_wallet_balance(message.from_user.id, bonus)
+                        try:
+                            await bot.send_message(
+                                referrer_id,
+                                f"🎉 یک نفر با لینک دعوت شما وارد ربات شد!\n"
+                                f"💰 {bonus:,} تومان به‌خاطر دعوت موفق به کیف پولت اضافه شد.\n"
+                                f"🤝 قضیه برد مساوی برده — تو و دوستت هر دو سود می‌کنید!",
+                            )
+                        except Exception as e:
+                            logging.warning(f"Could not notify referrer {referrer_id}: {e}")
+                        try:
+                            await message.answer(
+                                f"🎁 چون با لینک دعوت وارد شدی، <b>{bonus:,} تومان</b> به کیف پولت اضافه شد!\n"
+                                f"🤝 این یه بازی برد–برده؛ دوستت هم همین مبلغ رو گرفت 💚",
+                                parse_mode="HTML",
+                            )
+                        except Exception as e:
+                            logging.warning(f"Could not notify referred about join bonus: {e}")
+                    else:
+                        try:
+                            await bot.send_message(referrer_id, "🎉 یک نفر با لینک دعوت شما وارد ربات شد!")
+                        except Exception as e:
+                            logging.warning(f"Could not notify referrer {referrer_id}: {e}")
 
     # عضویت اجباری: اگر عضو نباشه فقط صفحه جوین نشون داده میشه
     if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
@@ -1581,14 +1604,22 @@ async def invite_handler(message: Message, state: FSMContext):
     commission_percent = await db.get_referral_commission_percent()
     total_earned = await db.get_total_referral_earnings(referrer_id)
 
+    join_bonus = int(getattr(config, "REFERRAL_JOIN_BONUS", 30000) or 0)
     text = (
         f"🤝 <b>دعوت دوستان</b>\n\n"
         f"لینک اختصاصی شما:\n<code>{link}</code>\n\n"
         f"👥 تعداد افراد دعوت‌شده: {total}\n"
         f"✅ تعداد خریدهای موفق زیرمجموعه: {converted}\n"
         f"💰 مجموع پورسانتی دریافتی تا الان: <b>{total_earned:,} تومان</b>\n\n"
-        f"🎁 به‌ازای <b>هر</b> خرید موفق دوستانی که با لینک شما وارد بشن، <b>{commission_percent}٪</b> از "
-        f"مبلغ خریدشون بلافاصله و به‌صورت نقدی به کیف پول شما اضافه میشه — برای همیشه و بدون محدودیت تعداد دفعات! 💸"
+        f"🎁 وقتی کسی با لینک تو وارد ربات بشه:\n"
+        f"• به <b>تو</b> {join_bonus:,} تومان\n"
+        f"• به <b>اون</b> هم {join_bonus:,} تومان\n"
+        f"مستقیم تو کیف پول واریز می‌شه.\n\n"
+        f"🛒 به‌ازای <b>هر</b> خرید موفق زیرمجموعه‌ات هم <b>{commission_percent}٪</b> از مبلغ خرید "
+        f"به کیف پولت اضافه می‌شه — برای همیشه و بدون محدودیت!\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"⚖️ <b>قضیه برد مساوی برد هست</b>\n"
+        f"هم تو سود می‌کنی، هم دوستی که دعوت می‌کنی. لینکت رو بفرست و با هم برنده باشید 💚"
     )
 
     await message.answer(text, parse_mode="HTML", reply_markup=back_menu_kb())

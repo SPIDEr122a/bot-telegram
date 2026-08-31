@@ -31,6 +31,8 @@ REQUIRED_CHANNELS = [x.strip() for x in os.getenv("REQUIRED_CHANNELS", "").split
 # تنظیمات سیستم رفرال (دعوت دوستان)
 REFERRAL_REQUIRED_COUNT = int(os.getenv("REFERRAL_REQUIRED_COUNT", "3"))   # تعداد خرید موفق لازم
 REFERRAL_REWARD_VOLUME = int(os.getenv("REFERRAL_REWARD_VOLUME", "50"))   # حجم هدیه گیمینگ (گیگ)
+# پاداش ورود با لینک دعوت — به هر دو طرف (دعوت‌کننده + دعوت‌شونده)
+REFERRAL_JOIN_BONUS = int(os.getenv("REFERRAL_JOIN_BONUS", "30000"))
 
 # تعرفه‌های پیش‌فرض سرویس گیمینگ - فقط در اولین اجرا (وقتی دیتابیس خالیه) استفاده میشه
 # بعد از اون، قیمت‌ها از دیتابیس خونده میشن و از طریق دستور ادمین توی خود ربات قابل تغییرن
