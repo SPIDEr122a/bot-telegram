@@ -1147,10 +1147,9 @@ async def admin_reject_free_test(callback: CallbackQuery):
 # جوایز: وزن‌ها احتمال نسبی هستند
 WHEEL_MAX_SPINS_PER_DAY = 3
 WHEEL_PRIZES = [
-    {"key": "wallet_10", "label": "۱۰٬۰۰۰ تومان کیف پول", "weight": 20, "type": "wallet", "amount": 10_000},
-    {"key": "wallet_20", "label": "۲۰٬۰۰۰ تومان کیف پول", "weight": 12, "type": "wallet", "amount": 20_000},
-    {"key": "wallet_50", "label": "۵۰٬۰۰۰ تومان کیف پول", "weight": 5, "type": "wallet", "amount": 50_000},
-    {"key": "config_2gb", "label": "کانفیگ ۲ گیگ (۳۰ روزه)", "weight": 15, "type": "config", "gb": 2.0, "days": 30},
+    {"key": "wallet_10", "label": "۱۰٬۰۰۰ تومان کیف پول", "weight": 22, "type": "wallet", "amount": 10_000},
+    {"key": "wallet_20", "label": "۲۰٬۰۰۰ تومان کیف پول", "weight": 14, "type": "wallet", "amount": 20_000},
+    {"key": "config_1gb", "label": "کانفیگ ۱ گیگ (۳۰ روزه)", "weight": 16, "type": "config", "gb": 1.0, "days": 30},
     {"key": "empty_1", "label": "پوچ 😅", "weight": 24, "type": "empty"},
     {"key": "empty_2", "label": "پوچ 😅", "weight": 24, "type": "empty"},
 ]
