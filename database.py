@@ -174,6 +174,21 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wheel_spins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                prize_key TEXT NOT NULL,
+                prize_label TEXT,
+                created_at TEXT NOT NULL,
+                spin_date TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wheel_spins_user_date ON wheel_spins(user_id, spin_date)"
+        )
         await db.commit()
 
         # مهاجرت: ستون payment_method به جدول orders (برای دیتابیس‌های قدیمی‌تر که این ستون رو ندارن)
@@ -921,5 +936,31 @@ async def deliver_free_test(user_id: int, panel_info: str) -> None:
             """UPDATE free_tests SET status = 'delivered', panel_info = ?, delivered_at = ?
                WHERE user_id = ?""",
             (panel_info, datetime.now().isoformat(), user_id),
+        )
+        await db.commit()
+
+
+# ---------- گردونه شانس ----------
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+async def count_wheel_spins_today(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM wheel_spins WHERE user_id = ? AND spin_date = ?",
+            (user_id, _today_str()),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+
+async def record_wheel_spin(user_id: int, prize_key: str, prize_label: str) -> None:
+    now = datetime.now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO wheel_spins (user_id, prize_key, prize_label, created_at, spin_date)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, prize_key, prize_label, now.isoformat(), now.strftime("%Y-%m-%d")),
         )
         await db.commit()

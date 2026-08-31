@@ -181,9 +181,9 @@ class AdminStates(StatesGroup):
 def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text="🛍 خرید سرویس"), KeyboardButton(text="🖥 سرویس‌های من")],
-        [KeyboardButton(text="🎁 تست رایگان"), KeyboardButton(text="💰 کیف پول")],
-        [KeyboardButton(text="💬 پشتیبانی"), KeyboardButton(text="🤝 دعوت دوستان")],
-        [KeyboardButton(text="📜 قوانین")],
+        [KeyboardButton(text="🎁 تست رایگان"), KeyboardButton(text="🎰 گردونه شانس")],
+        [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="💬 پشتیبانی")],
+        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="📜 قوانین")],
     ]
     if user_id is not None and user_id in config.ADMIN_IDS:
         keyboard.append([KeyboardButton(text="🛠 مدیریت ربات")])
@@ -1141,6 +1141,177 @@ async def admin_reject_free_test(callback: CallbackQuery):
 
     await callback.message.answer(f"❌ تست رایگان کاربر {user_id} رد شد.")
     await callback.answer()
+
+
+# ---------- گردونه شانس ----------
+# جوایز: وزن‌ها احتمال نسبی هستند
+WHEEL_MAX_SPINS_PER_DAY = 3
+WHEEL_PRIZES = [
+    {"key": "wallet_10", "label": "۱۰٬۰۰۰ تومان کیف پول", "weight": 20, "type": "wallet", "amount": 10_000},
+    {"key": "wallet_20", "label": "۲۰٬۰۰۰ تومان کیف پول", "weight": 12, "type": "wallet", "amount": 20_000},
+    {"key": "wallet_50", "label": "۵۰٬۰۰۰ تومان کیف پول", "weight": 5, "type": "wallet", "amount": 50_000},
+    {"key": "config_2gb", "label": "کانفیگ ۲ گیگ (۳۰ روزه)", "weight": 15, "type": "config", "gb": 2.0, "days": 30},
+    {"key": "empty_1", "label": "پوچ 😅", "weight": 24, "type": "empty"},
+    {"key": "empty_2", "label": "پوچ 😅", "weight": 24, "type": "empty"},
+]
+
+
+def _pick_wheel_prize() -> dict:
+    import random
+
+    weights = [p["weight"] for p in WHEEL_PRIZES]
+    return random.choices(WHEEL_PRIZES, weights=weights, k=1)[0]
+
+
+def wheel_spin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 بچرخون!", callback_data="wheel:spin")],
+            [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back:menu")],
+        ]
+    )
+
+
+@dp.message(F.text == "🎰 گردونه شانس")
+async def wheel_entry(message: Message, state: FSMContext):
+    await state.clear()
+    if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
+        await message.answer(JOIN_REQUIRED_TEXT, parse_mode="HTML", reply_markup=await build_join_kb())
+        return
+
+    used = await db.count_wheel_spins_today(message.from_user.id)
+    left = max(0, WHEEL_MAX_SPINS_PER_DAY - used)
+    prize_lines = "\n".join(f"• {p['label']}" for p in WHEEL_PRIZES if p["type"] != "empty")
+    prize_lines += "\n• پوچ"
+    await message.answer(
+        f"🎰 <b>گردونه شانس</b>\n\n"
+        f"هر روز <b>{WHEEL_MAX_SPINS_PER_DAY}</b> شانس داری.\n"
+        f"امروز استفاده شده: <b>{used}</b> | باقی‌مانده: <b>{left}</b>\n\n"
+        f"جوایز احتمالی:\n{prize_lines}",
+        parse_mode="HTML",
+        reply_markup=wheel_spin_kb() if left > 0 else back_menu_kb(),
+    )
+
+
+@dp.callback_query(F.data == "wheel:spin")
+async def wheel_spin(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    if config.REQUIRED_CHANNELS and not await is_user_member(user_id):
+        await callback.answer("ابتدا عضو کانال شوید.", show_alert=True)
+        return
+
+    used = await db.count_wheel_spins_today(user_id)
+    if used >= WHEEL_MAX_SPINS_PER_DAY:
+        await callback.answer("امروز شانس‌هات تموم شده. فردا دوباره بیا!", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=back_menu_kb())
+        except Exception:
+            pass
+        return
+
+    await callback.answer("🎰 در حال چرخش...")
+    prize = _pick_wheel_prize()
+    await db.record_wheel_spin(user_id, prize["key"], prize["label"])
+    left = max(0, WHEEL_MAX_SPINS_PER_DAY - (used + 1))
+
+    result_text = f"🎰 نتیجه گردونه:\n\n🎯 <b>{prize['label']}</b>\n\n"
+
+    if prize["type"] == "empty":
+        result_text += "این بار شانس نیاوردی 😅 دوباره امتحان کن!"
+    elif prize["type"] == "wallet":
+        amount = int(prize["amount"])
+        await db.add_wallet_balance(user_id, amount)
+        bal = await db.get_wallet_balance(user_id)
+        result_text += f"✅ {amount:,} تومان به کیف پولت اضافه شد.\n💰 موجودی الان: <b>{bal:,} تومان</b>"
+    elif prize["type"] == "config":
+        if not config.is_panel_auto_enabled():
+            result_text += (
+                "✅ برنده‌ی کانفیگ شدی!\n"
+                "ساخت خودکار پنل خاموش است؛ ادمین به‌زودی برات ارسال می‌کند."
+            )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"🎰 برنده کانفیگ گردونه\n"
+                        f"👤 {callback.from_user.full_name}\n"
+                        f"🆔 <code>{user_id}</code>\n"
+                        f"📦 {prize['label']}",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        else:
+            try:
+                import panel as pg_panel
+
+                result = await pg_panel.create_service_account(
+                    telegram_user_id=user_id,
+                    order_id=0,
+                    data_limit_gb=float(prize.get("gb") or 2.0),
+                    expire_days=int(prize.get("days") or 30),
+                    service_name=f"تک کاربره 👤 | {int(prize.get('gb') or 2)} گیگابایت",
+                    volume_label=f"{int(prize.get('gb') or 2)} گیگابایت",
+                    duration_label=f"{int(prize.get('days') or 30)} روزه",
+                    hwid_limit=1,
+                )
+                sub = (result.get("subscription_url") or "").strip()
+                msg = (
+                    f"🎰 نتیجه گردونه:\n\n🎯 <b>{prize['label']}</b>\n\n"
+                    f"{result['message']}"
+                )
+                if sub:
+                    try:
+                        from aiogram.types import BufferedInputFile
+
+                        qr = pg_panel.make_qr_png(sub)
+                        cap = msg if len(msg) <= 1024 else msg[:1000] + "…"
+                        await callback.message.answer_photo(
+                            BufferedInputFile(qr, filename="qr.png"),
+                            caption=cap,
+                        )
+                        result_text = ""  # already sent
+                    except Exception as e:
+                        logging.warning(f"Wheel QR failed: {e}")
+                        result_text = msg
+                else:
+                    result_text = msg
+            except Exception as e:
+                logging.exception("Wheel config create failed")
+                result_text += f"⚠️ ساخت کانفیگ خطا داد. ادمین مطلع شد.\n<code>{e}</code>"
+                for admin_id in config.ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"⚠️ خطا گردونه کانفیگ برای <code>{user_id}</code>:\n<code>{e}</code>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+
+    result_text = (result_text or "") + f"\n\nشانس باقی‌مانده امروز: <b>{left}</b>"
+    kb = wheel_spin_kb() if left > 0 else back_menu_kb()
+    if result_text.strip():
+        try:
+            await callback.message.answer(result_text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            await callback.message.answer(result_text, reply_markup=kb)
+
+    # نوتیف ادمین برای جوایز غیرپوچ
+    if prize["type"] != "empty":
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎰 گردونه شانس\n"
+                    f"👤 {callback.from_user.full_name} (@{callback.from_user.username or '-'})\n"
+                    f"🆔 <code>{user_id}</code>\n"
+                    f"🎁 {prize['label']}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
 
 
 @dp.message(F.text == "💰 کیف پول")
