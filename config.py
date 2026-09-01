@@ -19,6 +19,21 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 # نام برند/ربات که در پیام خوش‌آمدگویی نمایش داده میشه
 BRAND_NAME = os.getenv("BRAND_NAME", "X4G")
 
+# بنر قبل از خوش‌آمدگویی (/start)
+# اگر START_BANNER_ENABLED=0 باشد بنر نشان داده نمی‌شود
+START_BANNER_ENABLED = os.getenv("START_BANNER_ENABLED", "1").strip() not in ("0", "false", "False", "no")
+START_BANNER_TEXT = os.getenv(
+    "START_BANNER_TEXT",
+    (
+        "🎯 <b>پیشنهاد ویژه</b>\n\n"
+        "سرویس پایدار · تحویل سریع · پشتیبانی پاسخ‌گو\n"
+        "از منوی پایین «🛍 خرید سرویس» یا «🎁 تست رایگان» را امتحان کن."
+    ),
+).replace("\\n", "\n")
+# عکس بنر: یا لینک مستقیم https یا file_id تلگرام (یکی کافی است)
+START_BANNER_PHOTO_URL = os.getenv("START_BANNER_PHOTO_URL", "").strip()
+START_BANNER_PHOTO_FILE_ID = os.getenv("START_BANNER_PHOTO_FILE_ID", "").strip()
+
 # آیدی پشتیبانی (بدون @) - در دکمه «ارتباط با پشتیبانی» استفاده میشه
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "SuppX4G")
 
@@ -77,6 +92,20 @@ PASARGUARD_TEST_EXPIRE_HOURS = int(os.getenv("PASARGUARD_TEST_EXPIRE_HOURS", "48
 # (نام متغیر قدیمی PASARGUARD_TEST_GROUP_IDS هم هنوز کار می‌کنه)
 _raw_groups = os.getenv("PASARGUARD_TEST_GROUPS") or os.getenv("PASARGUARD_TEST_GROUP_IDS") or ""
 PASARGUARD_TEST_GROUPS = [x.strip() for x in _raw_groups.split(",") if x.strip()]
+
+# گروه‌های جدا برای تست گیمینگ / مولتی (اگر خالی باشد از PASARGUARD_TEST_GROUPS استفاده می‌شود)
+_raw_tg = os.getenv("PASARGUARD_TEST_GROUPS_GAMING", "").strip()
+PASARGUARD_TEST_GROUPS_GAMING = [x.strip() for x in _raw_tg.split(",") if x.strip()] or list(PASARGUARD_TEST_GROUPS)
+_raw_tm = os.getenv("PASARGUARD_TEST_GROUPS_MULTI", "").strip()
+PASARGUARD_TEST_GROUPS_MULTI = [x.strip() for x in _raw_tm.split(",") if x.strip()] or list(PASARGUARD_TEST_GROUPS)
+
+PASARGUARD_TEST_LOCATION_GAMING = os.getenv("PASARGUARD_TEST_LOCATION_GAMING", "گیمینگ")
+PASARGUARD_TEST_LOCATION_MULTI = os.getenv(
+    "PASARGUARD_TEST_LOCATION_MULTI",
+    os.getenv("PASARGUARD_TEST_LOCATION_NAME", "مولتی لوکیشن"),
+)
+# فاصله بررسی انقضای تست‌ها (ثانیه) — پیش‌فرض ۵ دقیقه
+FREE_TEST_CLEANUP_INTERVAL_SEC = int(os.getenv("FREE_TEST_CLEANUP_INTERVAL_SEC", "300"))
 
 # پیشوند نام کاربری تست (مثلاً test_)
 PASARGUARD_TEST_USERNAME_PREFIX = os.getenv("PASARGUARD_TEST_USERNAME_PREFIX", "test_")
@@ -148,77 +177,25 @@ PASARGUARD_SERVICE_MESSAGE = os.getenv(
     ),
 )
 
+# ---------- آموزش استفاده (ویدیو تلگرام) ----------
+# فرمت: نام|لینک,نام|لینک
+# مثال: TUTORIAL_LINKS=v2rayNG|https://t.me/xxx/10,Streisand|https://t.me/xxx/11
+_raw_tutorials = os.getenv("TUTORIAL_LINKS", "").strip()
+TUTORIAL_LINKS = []
+for _part in _raw_tutorials.split(","):
+    _part = _part.strip()
+    if not _part or "|" not in _part:
+        continue
+    _name, _url = _part.split("|", 1)
+    _name, _url = _name.strip(), _url.strip()
+    if _name and _url.startswith("http"):
+        TUTORIAL_LINKS.append((_name, _url))
 
-# ---------- گردونه شانس ----------
-# تعداد شانس روزانه هر کاربر
-WHEEL_MAX_SPINS_PER_DAY = int(os.getenv("WHEEL_MAX_SPINS_PER_DAY", "3"))
-
-# جوایز — با ; از هم جدا شوند. فرمت هر جایزه:
-#   wallet|مبلغ_تومان|وزن
-#   config|حجم_گیگ|روز|وزن     (مثال 0.5 = ۵۰۰ مگ)
-#   empty|وزن
-# مثال پیش‌فرض:
-# WHEEL_PRIZES=wallet|10000|22;wallet|20000|14;config|0.5|30|16;empty|24;empty|24
-_DEFAULT_WHEEL = "wallet|10000|22;wallet|20000|14;config|0.5|30|16;empty|24;empty|24"
-
-
-def _parse_wheel_prizes(raw: str) -> list[dict]:
-    prizes: list[dict] = []
-    for i, part in enumerate((raw or "").split(";")):
-        part = part.strip()
-        if not part:
-            continue
-        bits = [b.strip() for b in part.split("|")]
-        kind = (bits[0] or "").lower()
-        try:
-            if kind == "wallet" and len(bits) >= 3:
-                amount = int(bits[1])
-                weight = int(bits[2])
-                prizes.append(
-                    {
-                        "key": f"wallet_{amount}_{i}",
-                        "label": f"{amount:,} تومان کیف پول".replace(",", "٬"),
-                        "weight": weight,
-                        "type": "wallet",
-                        "amount": amount,
-                    }
-                )
-            elif kind == "config" and len(bits) >= 4:
-                gb = float(bits[1])
-                days = int(bits[2])
-                weight = int(bits[3])
-                if gb < 1:
-                    mb = int(round(gb * 1024))
-                    if abs(gb * 1024 - 512) < 2:
-                        mb = 500
-                    vol = f"{mb} مگ"
-                else:
-                    vol = f"{int(gb) if gb == int(gb) else gb} گیگ"
-                prizes.append(
-                    {
-                        "key": f"config_{gb}_{days}_{i}",
-                        "label": f"کانفیگ {vol} ({days} روزه)",
-                        "weight": weight,
-                        "type": "config",
-                        "gb": gb,
-                        "days": days,
-                    }
-                )
-            elif kind == "empty" and len(bits) >= 2:
-                weight = int(bits[1])
-                prizes.append(
-                    {
-                        "key": f"empty_{i}",
-                        "label": "پوچ 😅",
-                        "weight": weight,
-                        "type": "empty",
-                    }
-                )
-        except (ValueError, IndexError):
-            continue
-    return prizes
-
-
-WHEEL_PRIZES = _parse_wheel_prizes(os.getenv("WHEEL_PRIZES", _DEFAULT_WHEEL))
-if not WHEEL_PRIZES:
-    WHEEL_PRIZES = _parse_wheel_prizes(_DEFAULT_WHEEL)
+TUTORIAL_PROMPT = os.getenv(
+    "TUTORIAL_PROMPT",
+    (
+        "📚 <b>آموزش استفاده</b>\n\n"
+        "برای کدام برنامه می‌خواهید آموزش ببینید؟\n"
+        "روی دکمه بزنید تا ویدیو باز شود."
+    ),
+)
