@@ -343,8 +343,6 @@ def admin_decision_kb(order_id: int) -> InlineKeyboardMarkup:
 
 
 # ---------- User handlers ----------
-@dp.message(CommandStart())
-
 async def send_start_banner(chat_id: int) -> None:
     """بنر تبلیغاتی قبل از پیام خوش‌آمد — قابل تنظیم از Variables."""
     if not getattr(config, "START_BANNER_ENABLED", True):
@@ -368,6 +366,7 @@ async def send_start_banner(chat_id: int) -> None:
                 pass
 
 
+@dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
 
