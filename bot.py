@@ -156,6 +156,13 @@ class WalletStates(StatesGroup):
 
 
 class AdminStates(StatesGroup):
+    panel_name = State()
+    panel_url = State()
+    panel_user = State()
+    panel_pass = State()
+    panel_token = State()
+    panel_inbound = State()
+
     waiting_for_panel_info = State()
     waiting_for_reject_reason = State()
     waiting_for_freetest_info = State()
@@ -194,15 +201,15 @@ def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
 
 
 
-def delivery_extra_kb(subscription_url: str | None = None) -> InlineKeyboardMarkup:
-    """دکمه آموزش استفاده بعد از تست/خرید."""
+def delivery_extra_kb(subscription_url: str | None = None) -> InlineKeyboardMarkup | None:
+    """دکمه آموزش استفاده بعد از تست/خرید؛ اگر چیزی نباشد None."""
     rows = []
     if getattr(config, "TUTORIAL_LINKS", None):
         rows.append(
             [InlineKeyboardButton(text="📚 مشاهده آموزش استفاده", callback_data="tutorial:menu")]
         )
     if not rows:
-        return None  # type: ignore
+        return None
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -342,7 +349,12 @@ def admin_decision_kb(order_id: int) -> InlineKeyboardMarkup:
     )
 
 
+async def _panel_ready() -> bool:
+    return bool(config.is_panel_auto_enabled())
+
+
 # ---------- User handlers ----------
+
 async def send_start_banner(chat_id: int) -> None:
     """بنر تبلیغاتی قبل از پیام خوش‌آمد — قابل تنظیم از Variables."""
     if not getattr(config, "START_BANNER_ENABLED", True):
@@ -1035,33 +1047,6 @@ async def free_test_handler(message: Message, state: FSMContext):
             )
         return
 
-    # جلوگیری از تست تکراری روی پنل (مثلاً بعد از ریست دیتابیس)
-    if config.is_panel_auto_enabled():
-        try:
-            import panel as pg_panel
-
-            check = await pg_panel.cleanup_duplicate_tests_for_user(user_id)
-            if check.get("active"):
-                await message.answer(
-                    "❌ روی پنل از قبل تست فعال برای این آیدی وجود دارد.\n"
-                    "تست جدید داده نمی‌شود. اگر تمام شده، پس از پاک‌سازی خودکار دوباره امتحان کنید.",
-                    reply_markup=main_menu_kb(user_id),
-                )
-                # ثبت در دیتابیس تا دوباره درخواست ندهد
-                await db.create_free_test_request(
-                    user_id,
-                    message.from_user.username or "",
-                    message.from_user.full_name,
-                )
-                await db.deliver_free_test(
-                    user_id,
-                    "existing panel test",
-                    panel_username=check["active"][0],
-                    test_kind="multi",
-                )
-                return
-        except Exception:
-            logging.exception("panel duplicate check failed")
 
     ok = await db.create_free_test_request(
         user_id,
@@ -1094,69 +1079,113 @@ async def free_test_handler(message: Message, state: FSMContext):
 
     wait_msg = await message.answer("⏳ در حال ساخت تست رایگان...")
     try:
-        import panel as pg_panel
+        import panel as pm
 
-        result = await pg_panel.create_test_account(user_id)
-        await db.deliver_free_test(
-            user_id,
-            result["message"],
-            panel_username=result.get("username"),
-            test_kind=result.get("kind") or "multi",
-            expire_at=result.get("expire_at"),
-        )
+        result = await pm.create_test_account(user_id)
+        # اول در دیتابیس delivered کن تا اگر ارسال تلگرام خطا داد، دوباره «در صف» نماند
+        _msg = result.get("message") or ""
+        try:
+            await db.deliver_free_test(
+                user_id,
+                _msg,
+                panel_username=result.get("username"),
+                test_kind=result.get("kind") or "multi",
+                expire_at=result.get("expire_at"),
+            )
+        except TypeError:
+            # database.py قدیمی بدون آرگومان‌های اضافه
+            await db.deliver_free_test(user_id, _msg)
         try:
             await wait_msg.delete()
         except Exception:
             pass
 
+        # متن + QR در یک پیام (عکس با کپشن)
+        text = (result.get("message") or "✅ تست آماده شد").strip()
         sub_url = (result.get("subscription_url") or "").strip()
+        kb = delivery_extra_kb(sub_url or None)
+        sent_text = False
+        sent_qr = False
+
         if sub_url:
             try:
                 from aiogram.types import BufferedInputFile
 
-                qr_bytes = pg_panel.make_qr_png(sub_url)
-                caption = result["message"]
-                if len(caption) > 1024:
-                    caption = caption[:1000].rstrip() + "…"
+                qr_bytes = pm.make_qr_png(sub_url)
+                caption = text if len(text) <= 1024 else text[:1000].rstrip() + "…"
+                kwargs = {"caption": caption}
+                if kb is not None:
+                    kwargs["reply_markup"] = kb
                 await message.answer_photo(
                     BufferedInputFile(qr_bytes, filename="qr.png"),
-                    caption=caption,
-                    reply_markup=delivery_extra_kb(sub_url),
+                    **kwargs,
                 )
-            except Exception as qr_err:
-                logging.warning(f"QR send failed: {qr_err}")
-                await message.answer(
-                    result["message"],
-                    reply_markup=delivery_extra_kb(sub_url),
-                    disable_web_page_preview=True,
-                )
-        else:
-            await message.answer(
-                result["message"],
-                reply_markup=delivery_extra_kb(None),
-                disable_web_page_preview=True,
-            )
-        await message.answer("از منوی زیر می‌توانید ادامه دهید:", reply_markup=main_menu_kb(user_id))
+                sent_text = True
+                sent_qr = True
+            except Exception as e:
+                logging.warning("photo+caption failed: %s", e)
+
+        if not sent_text:
+            try:
+                kwargs = {"disable_web_page_preview": True}
+                if kb is not None:
+                    kwargs["reply_markup"] = kb
+                await message.answer(text, **kwargs)
+                sent_text = True
+            except Exception:
+                try:
+                    await message.answer(text[:4000], disable_web_page_preview=True)
+                    sent_text = True
+                except Exception:
+                    logging.exception("text deliver failed")
+
+        try:
+            await message.answer("از منوی زیر می‌توانید ادامه دهید:", reply_markup=main_menu_kb(user_id))
+        except Exception:
+            pass
 
         admin_text = (
             f"🎁 تست رایگان گرفته شد\n"
             f"👤 {message.from_user.full_name}\n"
             f"🆔 <code>{user_id}</code>\n"
             f"🔗 @{message.from_user.username or '-'}\n"
-            f"🔑 <code>{result.get('username') or '-'}</code>"
+            f"🔑 <code>{result.get('username') or '-'}</code>\n"
+            f"📝 متن: {'✅' if sent_text else '❌'}\n"
+            f"📱 QR: {'✅' if sent_qr else ('❌' if sub_url else '— بدون لینک ساب')}"
         )
         for admin_id in config.ADMIN_IDS:
             try:
                 await bot.send_message(admin_id, admin_text, parse_mode="HTML")
             except Exception as e:
                 logging.warning(f"notify admin: {e}")
-    except Exception:
+    except Exception as e:
         logging.exception("Auto free-test panel error")
         await db.set_free_test_status(user_id, "rejected")
+        err_txt = str(e)[:500] or type(e).__name__
+        user_msg = (
+            "❌ ساخت تست ناموفق بود.\n\n"
+            f"<code>{err_txt}</code>\n\n"
+            "ادمین: PANEL_BASE_URL / PANEL_TYPE / یوزر / پسورد / "
+            "PASARGUARD_TEST_GROUPS را در Variables چک کنید."
+        )
         try:
-            await wait_msg.edit_text("❌ ساخت تست با خطا مواجه شد. بعداً دوباره تلاش کنید.")
+            await wait_msg.edit_text(user_msg, parse_mode="HTML")
         except Exception:
-            await message.answer("❌ ساخت تست با خطا مواجه شد.", reply_markup=main_menu_kb(user_id))
+            await message.answer(user_msg, parse_mode="HTML", reply_markup=main_menu_kb(user_id))
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    (
+                        "❌ خطای ساخت تست رایگان\n"
+                        f"👤 {message.from_user.full_name}\n"
+                        f"🆔 <code>{user_id}</code>\n\n"
+                        f"<code>{err_txt}</code>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data.startswith("ftapprove:"))
@@ -3063,6 +3092,269 @@ async def admin_cleanup_tests_cmd(message: Message):
     except Exception as e:
         logging.exception("manual cleanup")
         await message.answer(f"❌ خطا: {e}")
+
+
+
+# ---------- Admin: ثبت پنل ----------
+def _panel_type_kb() -> InlineKeyboardMarkup:
+    import panel as pm
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"adminpanel:type:{key}")]
+        for key, label in pm.PANEL_TYPE_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="adminpanel:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _panels_menu_kb() -> InlineKeyboardMarkup:
+    import panel as pm
+    panels = await db.list_panels(active_only=False)
+    rows = [[InlineKeyboardButton(text="➕ افزودن پنل جدید", callback_data="adminpanel:add")]]
+    for p in panels:
+        star = "⭐ " if p["is_default"] else ""
+        act = "✅" if p["is_active"] else "🚫"
+        label = pm.PANEL_TYPE_LABELS.get(p["panel_type"], p["panel_type"])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{star}{act} {p['name']} ({label})",
+                callback_data=f"adminpanel:view:{p['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="adminroot")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _panel_view_kb(panel_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ پیش‌فرض برای تست", callback_data=f"adminpanel:default:{panel_id}")],
+            [InlineKeyboardButton(text="🔌 تست اتصال", callback_data=f"adminpanel:test:{panel_id}")],
+            [
+                InlineKeyboardButton(text="✅/🚫 فعال", callback_data=f"adminpanel:toggle:{panel_id}"),
+                InlineKeyboardButton(text="🗑 حذف", callback_data=f"adminpanel:del:{panel_id}"),
+            ],
+            [InlineKeyboardButton(text="🔙 لیست پنل‌ها", callback_data="adminpanel:menu")],
+        ]
+    )
+
+
+@dp.callback_query(F.data == "adminpanel:menu")
+async def admin_panel_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("دسترسی ندارید", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🖥 <b>مدیریت پنل‌ها</b>\n\n"
+        "پنل پیش‌فرض (⭐) برای ساخت تست رایگان استفاده می‌شود.\n"
+        "انواع: سنایی · مرزبان · مرزنشین · PasarGuard",
+        parse_mode="HTML",
+        reply_markup=await _panels_menu_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adminpanel:add")
+async def admin_panel_add(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.clear()
+    await callback.message.edit_text("نوع پنل را انتخاب کنید:", reply_markup=_panel_type_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adminpanel:type:"))
+async def admin_panel_type(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    ptype = callback.data.split(":")[2]
+    await state.update_data(panel_type=ptype)
+    await state.set_state(AdminStates.panel_name)
+    await callback.message.edit_text("نام نمایشی پنل را بفرستید (مثلاً: سرور اصلی):")
+    await callback.answer()
+
+
+@dp.message(AdminStates.panel_name)
+async def admin_panel_name(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.update_data(panel_name=(message.text or "").strip())
+    await state.set_state(AdminStates.panel_url)
+    await message.answer("آدرس پنل را بفرستید (مثال: https://panel.example.com:2053):")
+
+
+@dp.message(AdminStates.panel_url)
+async def admin_panel_url(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    url = (message.text or "").strip().rstrip("/")
+    if not url.startswith("http"):
+        await message.answer("آدرس باید با http:// یا https:// شروع شود.")
+        return
+    await state.update_data(panel_url=url)
+    await state.set_state(AdminStates.panel_user)
+    await message.answer("نام کاربری ادمین پنل را بفرستید (اگر فقط API Token دارید بنویسید -):")
+
+
+@dp.message(AdminStates.panel_user)
+async def admin_panel_user(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    u = (message.text or "").strip()
+    await state.update_data(panel_user="" if u == "-" else u)
+    await state.set_state(AdminStates.panel_pass)
+    await message.answer("رمز عبور پنل را بفرستید (اگر ندارید بنویسید -):")
+
+
+@dp.message(AdminStates.panel_pass)
+async def admin_panel_pass(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    pw = (message.text or "").strip()
+    await state.update_data(panel_pass="" if pw == "-" else pw)
+    await state.set_state(AdminStates.panel_token)
+    await message.answer(
+        "API Token را بفرستید (اختیاری — اگر ندارید بنویسید -):\n"
+        "برای مرزبان/مرزنشین اگر توکن دارید اینجا بگذارید."
+    )
+
+
+@dp.message(AdminStates.panel_token)
+async def admin_panel_token(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    tok = (message.text or "").strip()
+    await state.update_data(panel_token="" if tok == "-" else tok)
+    data = await state.get_data()
+    if data.get("panel_type") == "sanaei":
+        await state.set_state(AdminStates.panel_inbound)
+        await message.answer("Inbound ID سنایی را بفرستید (عدد inbound برای ساخت کلاینت تست):")
+        return
+    await _save_new_panel(message, state, inbound_id="")
+
+
+@dp.message(AdminStates.panel_inbound)
+async def admin_panel_inbound(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    await _save_new_panel(message, state, inbound_id=(message.text or "").strip())
+
+
+async def _save_new_panel(message: Message, state: FSMContext, inbound_id: str):
+    data = await state.get_data()
+    await state.clear()
+    panels = await db.list_panels()
+    is_default = len(panels) == 0
+    pid = await db.add_panel(
+        name=data.get("panel_name") or "پنل",
+        panel_type=data.get("panel_type") or "marzban",
+        base_url=data.get("panel_url") or "",
+        username=data.get("panel_user") or "",
+        password=data.get("panel_pass") or "",
+        api_token=data.get("panel_token") or "",
+        inbound_id=inbound_id,
+        is_default=is_default,
+    )
+    note = "⭐ به‌عنوان پیش‌فرض تنظیم شد.\n" if is_default else ""
+    await message.answer(
+        f"✅ پنل ثبت شد (#{pid}).\n{note}"
+        "از منوی ثبت پنل می‌توانید پیش‌فرض را عوض یا تست اتصال بگیرید.",
+        reply_markup=await _panels_menu_kb(),
+    )
+
+
+@dp.callback_query(F.data.startswith("adminpanel:view:"))
+async def admin_panel_view(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    pid = int(callback.data.split(":")[2])
+    p = await db.get_panel(pid)
+    if not p:
+        await callback.answer("پیدا نشد", show_alert=True)
+        return
+    import panel as pm
+    label = pm.PANEL_TYPE_LABELS.get(p["panel_type"], p["panel_type"])
+    text = (
+        f"🖥 <b>{p['name']}</b>\n"
+        f"نوع: {label}\n"
+        f"آدرس: <code>{p['base_url']}</code>\n"
+        f"کاربر: <code>{p['username'] or '-'}</code>\n"
+        f"Inbound: <code>{p['inbound_id'] or '-'}</code>\n"
+        f"پیش‌فرض: {'⭐ بله' if p['is_default'] else 'خیر'}\n"
+        f"فعال: {'✅' if p['is_active'] else '🚫'}"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=await _panel_view_kb(pid))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adminpanel:default:"))
+async def admin_panel_default(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    pid = int(callback.data.split(":")[2])
+    await db.set_default_panel(pid)
+    await callback.answer("پیش‌فرض شد ✅", show_alert=True)
+    p = await db.get_panel(pid)
+    if p:
+        import panel as pm
+        label = pm.PANEL_TYPE_LABELS.get(p["panel_type"], p["panel_type"])
+        await callback.message.edit_text(
+            f"🖥 <b>{p['name']}</b>\nنوع: {label}\n⭐ پیش‌فرض فعال شد",
+            parse_mode="HTML",
+            reply_markup=await _panel_view_kb(pid),
+        )
+
+
+@dp.callback_query(F.data.startswith("adminpanel:toggle:"))
+async def admin_panel_toggle(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    pid = int(callback.data.split(":")[2])
+    p = await db.get_panel(pid)
+    if not p:
+        await callback.answer("پیدا نشد", show_alert=True)
+        return
+    await db.update_panel(pid, is_active=0 if p["is_active"] else 1)
+    await callback.answer("وضعیت عوض شد", show_alert=True)
+    await callback.message.edit_text("🖥 مدیریت پنل‌ها", reply_markup=await _panels_menu_kb())
+
+
+@dp.callback_query(F.data.startswith("adminpanel:del:"))
+async def admin_panel_del(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    pid = int(callback.data.split(":")[2])
+    await db.delete_panel(pid)
+    await callback.answer("حذف شد", show_alert=True)
+    await callback.message.edit_text("🖥 مدیریت پنل‌ها", reply_markup=await _panels_menu_kb())
+
+
+@dp.callback_query(F.data.startswith("adminpanel:test:"))
+async def admin_panel_test(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    pid = int(callback.data.split(":")[2])
+    await callback.answer()
+    import panel as pm
+    msg = await pm.test_panel_connection(pid)
+    await callback.message.answer(msg)
+
+
+
+@dp.message(Command("reset_freetest"))
+async def admin_reset_freetest(message: Message):
+    """ادمین: /reset_freetest 123456789 — پاک کردن سابقه تست یک کاربر"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("فرمت: /reset_freetest USER_ID")
+        return
+    uid = int(parts[1])
+    async with __import__("aiosqlite").connect(config.DB_PATH) as con:
+        await con.execute("DELETE FROM free_tests WHERE user_id = ?", (uid,))
+        await con.commit()
+    await message.answer(f"✅ سابقه تست کاربر <code>{uid}</code> پاک شد. می‌تواند دوباره تست بگیرد.", parse_mode="HTML")
 
 
 # ---------- Startup ----------

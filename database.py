@@ -176,6 +176,38 @@ async def init_db():
         )
         await db.commit()
 
+        # ستون‌های تست: نام پنل، نوع، انقضا
+        for col_sql in (
+            "ALTER TABLE free_tests ADD COLUMN panel_username TEXT",
+            "ALTER TABLE free_tests ADD COLUMN test_kind TEXT",
+            "ALTER TABLE free_tests ADD COLUMN expire_at INTEGER",
+        ):
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except Exception:
+                pass
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS panels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                panel_type TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                username TEXT,
+                password TEXT,
+                api_token TEXT,
+                inbound_id TEXT,
+                extra TEXT,
+                is_active INTEGER DEFAULT 1,
+                is_default INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+            """
+        )
+        await db.commit()
+
         # مهاجرت: ستون payment_method به جدول orders (برای دیتابیس‌های قدیمی‌تر که این ستون رو ندارن)
         try:
             await db.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT DEFAULT 'receipt'")
@@ -868,7 +900,7 @@ async def has_claimed_free_test(user_id: int) -> bool:
     """آیا این کاربر قبلاً تست رایگان گرفته (pending/delivered)؟"""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT 1 FROM free_tests WHERE user_id = ? AND status IN ('pending', 'delivered')",
+            "SELECT 1 FROM free_tests WHERE user_id = ? AND status IN ('pending', 'delivered', 'expired')",
             (user_id,),
         )
         return await cursor.fetchone() is not None
@@ -881,7 +913,7 @@ async def create_free_test_request(user_id: int, username: str, full_name: str) 
             "SELECT status FROM free_tests WHERE user_id = ?", (user_id,)
         )
         row = await cursor.fetchone()
-        if row and row[0] in ("pending", "delivered"):
+        if row and row[0] in ("pending", "delivered", "expired"):
             return False
         # اگه rejected بوده یا اصلاً نبوده، upsert می‌کنیم
         await db.execute(
@@ -915,15 +947,53 @@ async def set_free_test_status(user_id: int, status: str) -> None:
         await db.commit()
 
 
-async def deliver_free_test(user_id: int, panel_info: str) -> None:
+async def deliver_free_test(
+    user_id: int,
+    panel_info: str,
+    panel_username: str | None = None,
+    test_kind: str | None = None,
+    expire_at: int | None = None,
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """UPDATE free_tests SET status = 'delivered', panel_info = ?, delivered_at = ?
+            """UPDATE free_tests SET status = 'delivered', panel_info = ?, delivered_at = ?,
+                   panel_username = COALESCE(?, panel_username),
+                   test_kind = COALESCE(?, test_kind),
+                   expire_at = COALESCE(?, expire_at)
                WHERE user_id = ?""",
-            (panel_info, datetime.now().isoformat(), user_id),
+            (
+                panel_info,
+                datetime.now().isoformat(),
+                panel_username,
+                test_kind,
+                expire_at,
+                user_id,
+            ),
         )
         await db.commit()
 
+
+async def list_delivered_free_tests_for_cleanup():
+    """تست‌های تحویل‌شده که هنوز منقضی/پاک نشده‌اند."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM free_tests
+               WHERE status = 'delivered' AND panel_username IS NOT NULL AND panel_username != ''"""
+        )
+        return await cur.fetchall()
+
+
+async def mark_free_test_expired(user_id: int, reason: str = "") -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        suffix = f"[expired:{reason}]" if reason else "[expired]"
+        await db.execute(
+            """UPDATE free_tests SET status = 'expired',
+                   panel_info = COALESCE(panel_info, '') || ?
+               WHERE user_id = ?""",
+            (suffix, user_id),
+        )
+        await db.commit()
 
 async def get_orders_report() -> dict:
     """آمار کلی سفارش‌ها برای پنل ادمین."""
@@ -979,3 +1049,112 @@ async def get_orders_report() -> dict:
             "delivered_today": delivered_today,
             "recent": recent,
         }
+
+
+# ---------- پنل‌های متصل (سنایی / مرزبان / مرزنشین / پاسارگارد) ----------
+async def list_panels(active_only: bool = False):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = "SELECT * FROM panels"
+        if active_only:
+            q += " WHERE is_active = 1"
+        q += " ORDER BY is_default DESC, id ASC"
+        cur = await db.execute(q)
+        return await cur.fetchall()
+
+
+async def get_panel(panel_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM panels WHERE id = ?", (panel_id,))
+        return await cur.fetchone()
+
+
+async def get_default_panel():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM panels WHERE is_active = 1 AND is_default = 1 ORDER BY id LIMIT 1"
+        )
+        row = await cur.fetchone()
+        if row:
+            return row
+        cur = await db.execute(
+            "SELECT * FROM panels WHERE is_active = 1 ORDER BY id LIMIT 1"
+        )
+        return await cur.fetchone()
+
+
+async def add_panel(
+    name: str,
+    panel_type: str,
+    base_url: str,
+    username: str = "",
+    password: str = "",
+    api_token: str = "",
+    inbound_id: str = "",
+    extra: str = "",
+    is_default: bool = False,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if is_default:
+            await db.execute("UPDATE panels SET is_default = 0")
+        cur = await db.execute(
+            """INSERT INTO panels
+               (name, panel_type, base_url, username, password, api_token, inbound_id, extra, is_active, is_default, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                name,
+                panel_type,
+                base_url.rstrip("/"),
+                username,
+                password,
+                api_token,
+                inbound_id,
+                extra,
+                1 if is_default else 0,
+                datetime.now().isoformat(),
+            ),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def update_panel(panel_id: int, **fields) -> None:
+    if not fields:
+        return
+    allowed = {
+        "name", "panel_type", "base_url", "username", "password",
+        "api_token", "inbound_id", "extra", "is_active", "is_default",
+    }
+    parts = []
+    vals = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k == "base_url" and isinstance(v, str):
+            v = v.rstrip("/")
+        parts.append(f"{k} = ?")
+        vals.append(v)
+    if not parts:
+        return
+    vals.append(panel_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        if fields.get("is_default"):
+            await db.execute("UPDATE panels SET is_default = 0")
+        await db.execute(f"UPDATE panels SET {', '.join(parts)} WHERE id = ?", vals)
+        await db.commit()
+
+
+async def delete_panel(panel_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM panels WHERE id = ?", (panel_id,))
+        await db.commit()
+
+
+async def set_default_panel(panel_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE panels SET is_default = 0")
+        await db.execute("UPDATE panels SET is_default = 1, is_active = 1 WHERE id = ?", (panel_id,))
+        await db.commit()
+
