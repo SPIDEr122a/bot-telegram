@@ -185,12 +185,19 @@ class AdminStates(StatesGroup):
     editing_wallet_bonus_threshold = State()
     editing_wallet_bonus_percent = State()
     waiting_for_backup_upload = State()
+    adding_multi_duration_label = State()
+    adding_multi_duration_days = State()
+    adding_multi_user_label = State()
+    adding_multi_user_limit = State()
+    adding_multi_plan_vol = State()
+    adding_multi_plan_price = State()
+
 
 
 # ---------- Keyboards ----------
 def main_menu_kb(user_id: int | None = None) -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text="🛍 خرید سرویس"), KeyboardButton(text="🖥 سرویس‌های من")],
+        [KeyboardButton(text="🛍️ خرید سرویس"), KeyboardButton(text="🛒 سرویس‌های من")],
         [KeyboardButton(text="🎁 تست رایگان"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="💬 پشتیبانی"), KeyboardButton(text="🤝 دعوت دوستان")],
         [KeyboardButton(text="📜 قوانین")],
@@ -232,7 +239,7 @@ async def services_kb() -> InlineKeyboardMarkup:
     """منوی خرید: گیمینگ + مولتی + دسته‌های سفارشی فعال که حداقل یک پلن فعال دارند."""
     rows = [
         [InlineKeyboardButton(text="🎮 سرویس گیمینگ", callback_data="svc:gaming")],
-        [InlineKeyboardButton(text="🌍 سرویس مولتی لوکیشن (وبگردی)", callback_data="svc:multi")],
+        [InlineKeyboardButton(text="🌍 مولتی لوکیشن", callback_data="svc:multi")],
     ]
     cats = await db.get_tariff_categories(active_only=True)
     for c in cats:
@@ -497,7 +504,7 @@ async def join_info_handler(callback: CallbackQuery):
     )
 
 
-@dp.message(F.text == "🛍 خرید سرویس")
+@dp.message(F.text.in_({"🛍️ خرید سرویس", "🛍 خرید سرویس", "🔴 خرید سرویس"}))
 async def show_services(message: Message, state: FSMContext):
     await state.clear()
     if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
@@ -570,14 +577,80 @@ async def choose_gaming_service(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "svc:multi")
 async def choose_multi_service(callback: CallbackQuery, state: FSMContext):
-    plans = await db.get_multi_plans()
-    if not plans:
-        await callback.answer("در حال حاضر تعرفه‌ای برای این سرویس ثبت نشده.", show_alert=True)
+    """مرحله ۱: مدت"""
+    durs = await db.get_multi_durations(active_only=True)
+    if not durs:
+        plans = await db.get_multi_plans()
+        if not plans:
+            await callback.answer("تعرفه‌ای نیست. از مدیریت → مولتی اضافه کنید.", show_alert=True)
+            return
+        await callback.message.edit_text(
+            "🌍 <b>مولتی لوکیشن</b>\nتعرفه را انتخاب کنید:",
+            parse_mode="HTML",
+            reply_markup=multi_plans_kb(plans),
+        )
+        await callback.answer()
         return
+    rows = [[InlineKeyboardButton(text=f"⏳ {d['label']}", callback_data=f"mdur:{d['id']}")] for d in durs]
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back:services")])
     await callback.message.edit_text(
-        "🌍 <b>سرویس مولتی لوکیشن (وبگردی)</b>\nتعرفه مورد نظر رو انتخاب کنید:",
+        "🌍 <b>مولتی لوکیشن</b>\n\nمدت سرویس را انتخاب کنید:",
         parse_mode="HTML",
-        reply_markup=multi_plans_kb(plans),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mdur:"))
+async def multi_pick_duration(callback: CallbackQuery, state: FSMContext):
+    dur_id = int(callback.data.split(":")[1])
+    dur = await db.get_multi_duration(dur_id)
+    if not dur or not dur["active"]:
+        await callback.answer("این مدت موجود نیست.", show_alert=True)
+        return
+    opts = await db.get_multi_user_options(active_only=True)
+    if not opts:
+        await callback.answer("تعداد کاربر تعریف نشده (مدیریت ربات).", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=f"👤 {o['label']}", callback_data=f"muser:{dur_id}:{o['id']}")] for o in opts]
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="svc:multi")])
+    await callback.message.edit_text(
+        f"🌍 <b>مولتی</b> — {dur['label']}\n\nتعداد کاربر را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("muser:"))
+async def multi_pick_users(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    dur_id, uo_id = int(parts[1]), int(parts[2])
+    dur = await db.get_multi_duration(dur_id)
+    uo = await db.get_multi_user_option(uo_id)
+    if not dur or not uo:
+        await callback.answer("نامعتبر", show_alert=True)
+        return
+    plans = await db.get_multi_plans_filtered(duration_id=dur_id, user_option_id=uo_id, active_only=True)
+    if not plans:
+        await callback.answer("برای این ترکیب پلنی نیست. از مدیریت اضافه کنید.", show_alert=True)
+        return
+    rows = []
+    for p in plans:
+        try:
+            vol = p["volume_gb"]
+        except Exception:
+            vol = None
+        vol_txt = f"{float(vol):g} گیگ" if vol is not None else str(p["label"])
+        rows.append([InlineKeyboardButton(
+            text=f"📊 {vol_txt} — {p['price']:,} تومان",
+            callback_data=f"mplan:{p['id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"mdur:{dur_id}")])
+    await callback.message.edit_text(
+        f"🌍 <b>مولتی</b> | {dur['label']} | {uo['label']}\n\nحجم را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
@@ -921,7 +994,7 @@ def order_detail_text(order) -> str:
     return text
 
 
-@dp.message(F.text == "🖥 سرویس‌های من")
+@dp.message(F.text.in_({"🛒 سرویس‌های من", "🖥 سرویس‌های من", "🔵 سرویس‌های من"}))
 async def my_orders(message: Message, state: FSMContext):
     await state.clear()
     if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
@@ -1019,7 +1092,7 @@ def free_test_admin_kb(user_id: int) -> InlineKeyboardMarkup:
 
 
 
-@dp.message(F.text == "🎁 تست رایگان")
+@dp.message(F.text.in_({"🎁 تست رایگان", "🟢 تست رایگان"}))
 async def free_test_handler(message: Message, state: FSMContext):
     await state.clear()
     if config.REQUIRED_CHANNELS and not await is_user_member(message.from_user.id):
@@ -1671,38 +1744,77 @@ async def gaming_admin_list_kb() -> InlineKeyboardMarkup:
 
 
 async def multi_admin_list_kb() -> InlineKeyboardMarkup:
+    """منوی مدیریت مولتی: مدت‌ها / تعداد کاربر / پلن‌های حجم+قیمت"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏳ مدیریت مدت‌ها (۱ ماهه / ۳ ماهه ...)", callback_data="mm:durations")],
+            [InlineKeyboardButton(text="👤 مدیریت تعداد کاربر", callback_data="mm:users")],
+            [InlineKeyboardButton(text="📊 مدیریت پلن‌ها (حجم + قیمت)", callback_data="mm:plans")],
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:menu")],
+        ]
+    )
+
+
+async def multi_durations_admin_kb() -> InlineKeyboardMarkup:
+    durs = await db.get_multi_durations(active_only=False)
+    rows = []
+    for d in durs:
+        st = "✅" if d["active"] else "🚫"
+        rows.append([InlineKeyboardButton(
+            text=f"{st} {d['label']} ({d['days']} روز)",
+            callback_data=f"mm:dur:{d['id']}",
+        )])
+        rows.append([
+            InlineKeyboardButton(text="⏸/▶️", callback_data=f"mm:durtog:{d['id']}"),
+            InlineKeyboardButton(text="🗑 حذف", callback_data=f"mm:durdel:{d['id']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ افزودن مدت", callback_data="mm:duradd")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:multi")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def multi_users_admin_kb() -> InlineKeyboardMarkup:
+    opts = await db.get_multi_user_options(active_only=False)
+    rows = []
+    for o in opts:
+        st = "✅" if o["active"] else "🚫"
+        rows.append([InlineKeyboardButton(
+            text=f"{st} {o['label']} (حد {o['hwid_limit']})",
+            callback_data=f"mm:uo:{o['id']}",
+        )])
+        rows.append([
+            InlineKeyboardButton(text="⏸/▶️", callback_data=f"mm:uotog:{o['id']}"),
+            InlineKeyboardButton(text="🗑 حذف", callback_data=f"mm:uodel:{o['id']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ افزودن تعداد کاربر", callback_data="mm:uoadd")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:multi")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def multi_plans_admin_kb() -> InlineKeyboardMarkup:
     plans = await db.get_multi_plans(active_only=False)
     rows = []
     for p in plans:
-        status = "✅ فعال" if p["active"] else "🚫 غیرفعال"
-        label_short = (p["label"] or "")[:40]
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{status} | {label_short} | {p['price']:,} ت",
-                    callback_data=f"mpriceedit:{p['id']}",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="💰 قیمت",
-                    callback_data=f"mpriceedit:{p['id']}",
-                ),
-                InlineKeyboardButton(
-                    text="⏸ غیرفعال" if p["active"] else "▶️ فعال",
-                    callback_data=f"mtoggle:{p['id']}",
-                ),
-                InlineKeyboardButton(
-                    text="🗑 حذف",
-                    callback_data=f"mdelete:{p['id']}",
-                ),
-            ]
-        )
-    rows.append([InlineKeyboardButton(text="➕ افزودن تعرفه جدید", callback_data="madd")])
-    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:menu")])
+        st = "✅" if p["active"] else "🚫"
+        try:
+            vol = p["volume_gb"]
+            vol_s = f"{float(vol):g}G" if vol is not None else "?"
+        except Exception:
+            vol_s = "?"
+        label = (p["label"] or "")[:28]
+        rows.append([InlineKeyboardButton(
+            text=f"{st} {label} | {vol_s} | {p['price']:,}ت",
+            callback_data=f"mpriceedit:{p['id']}",
+        )])
+        rows.append([
+            InlineKeyboardButton(text="⏸/▶️", callback_data=f"mtoggle:{p['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"mdelete:{p['id']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ افزودن پلن (مدت+کاربر+حجم+قیمت)", callback_data="mm:planadd")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admintariff:multi")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 
 
 ADMIN_ROOT_TEXT = "⚙️ <b>مدیریت ربات</b>\nچی رو می‌خواید تنظیم کنید؟"
@@ -1785,20 +1897,54 @@ async def admin_backup_download(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     from datetime import datetime as _dt
     from aiogram.types import FSInputFile
+    import sqlite3
+    import tempfile
 
     fname = f"bot_backup_{_dt.now().strftime('%Y%m%d_%H%M%S')}.db"
+    tmp_path = None
     try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        src = sqlite3.connect(path, timeout=60)
+        try:
+            src.execute("PRAGMA wal_checkpoint(FULL)")
+        except Exception:
+            pass
+        dst = sqlite3.connect(tmp_path)
+        try:
+            src.backup(dst)
+
+            def _cnt(table: str) -> int:
+                try:
+                    return int(dst.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                except Exception:
+                    return 0
+
+            g, m, tc, tp = _cnt("gaming_plans"), _cnt("multi_plans"), _cnt("tariff_categories"), _cnt("tariff_plans")
+        finally:
+            dst.close()
+            src.close()
+
         await callback.message.answer_document(
-            FSInputFile(path, filename=fname),
+            FSInputFile(tmp_path, filename=fname),
             caption=(
                 "⬇️ <b>بکاپ دیتابیس</b>\n"
-                "این فایل را قبل از ریست نگه دارید.\n"
+                f"🎮 گیمینگ: <b>{g}</b> پلن\n"
+                f"🌍 مولتی: <b>{m}</b> پلن\n"
+                f"📦 دسته سفارشی: <b>{tc}</b> | پلن: <b>{tp}</b>\n\n"
                 "برای بازگردانی: مدیریت ربات → ⬆️ آپلود بکاپ"
             ),
             parse_mode="HTML",
         )
     except Exception as e:
+        logging.exception("backup download")
         await callback.message.answer(f"❌ ارسال بکاپ ناموفق بود: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data == "adminbackup:ul")
@@ -1829,46 +1975,79 @@ async def admin_backup_upload_receive(message: Message, state: FSMContext):
 
     import shutil
     import tempfile
+    import sqlite3
 
     wait = await message.answer("⏳ در حال دریافت و جایگزینی بکاپ...")
     try:
-        # دانلود در فایل موقت
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
         tmp_path = tmp.name
         tmp.close()
         await bot.download(doc, destination=tmp_path)
 
-        # اعتبارسنجی sqlite
-        import sqlite3
-
         conn = sqlite3.connect(tmp_path)
         try:
-            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {r[0] for r in cur.fetchall()}
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+
+            def _cnt(table: str) -> int:
+                if table not in tables:
+                    return 0
+                try:
+                    return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                except Exception:
+                    return 0
+
+            g_cnt, m_cnt = _cnt("gaming_plans"), _cnt("multi_plans")
+            tc_cnt, tp_cnt = _cnt("tariff_categories"), _cnt("tariff_plans")
         finally:
             conn.close()
-        if "orders" not in tables:
+
+        if "orders" not in tables and "gaming_plans" not in tables:
             os.unlink(tmp_path)
-            await wait.edit_text("❌ این فایل بکاپ معتبر ربات نیست (جدول orders نیست).")
+            await wait.edit_text("❌ این فایل بکاپ معتبر ربات نیست.")
             return
 
         dest = config.DB_PATH
-        # بکاپ از فایل فعلی قبل از جایگزینی
+        try:
+            c = sqlite3.connect(dest, timeout=60)
+            c.execute("PRAGMA wal_checkpoint(FULL)")
+            c.close()
+        except Exception:
+            pass
         if os.path.isfile(dest):
             shutil.copy2(dest, dest + ".before_restore")
         shutil.copy2(tmp_path, dest)
+        for suffix in ("-wal", "-shm"):
+            side = dest + suffix
+            if os.path.isfile(side):
+                try:
+                    os.unlink(side)
+                except Exception:
+                    pass
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
 
-        # اطمینان از schema جدید روی بکاپ قدیمی
         await db.init_db()
+
+        _c = sqlite3.connect(dest)
+        try:
+            def _cnt2(table: str) -> int:
+                try:
+                    return int(_c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                except Exception:
+                    return 0
+            g2, m2 = _cnt2("gaming_plans"), _cnt2("multi_plans")
+            tc2, tp2 = _cnt2("tariff_categories"), _cnt2("tariff_plans")
+        finally:
+            _c.close()
+
         await state.clear()
         await wait.edit_text(
-            "✅ بکاپ با موفقیت بازگردانی شد.\n"
-            "تعرفه‌ها، سفارش‌ها، کیف پول و بقیه داده‌ها برگشتند.\n"
-            "(یک کپی از دیتای قبلی با پسوند .before_restore نگه داشته شد.)",
+            "✅ بکاپ بازگردانی شد.\n\n"
+            f"از فایل بکاپ: گیمینگ {g_cnt} | مولتی {m_cnt} | دسته {tc_cnt} | پلن سفارشی {tp_cnt}\n"
+            f"الان در ربات: گیمینگ {g2} | مولتی {m2} | دسته {tc2} | پلن سفارشی {tp2}\n\n"
+            "اگر عددها صفر شد، دوباره از ربات در حال کار بکاپ بگیرید.",
             reply_markup=admin_menu_kb(),
         )
     except Exception as e:
@@ -2763,8 +2942,34 @@ async def _parse_order_panel_spec(order) -> dict:
         return _spec_from_label(label)
 
     plan = await db.get_multi_plan(order["plan_id"])
-    label = (plan["label"] if plan else plan_name) or ""
-    return _spec_from_label(label)
+    if plan:
+        try:
+            vol = plan["volume_gb"] if "volume_gb" in plan.keys() else None
+            days = plan["duration_days"] if "duration_days" in plan.keys() else None
+            hwid = plan["hwid_limit"] if "hwid_limit" in plan.keys() else None
+            if (vol is not None) or (days is not None) or (hwid is not None) or plan["duration_id"]:
+                if days is None and plan["duration_id"]:
+                    d = await db.get_multi_duration(plan["duration_id"])
+                    days = d["days"] if d else 30
+                if hwid is None and plan["user_option_id"]:
+                    u = await db.get_multi_user_option(plan["user_option_id"])
+                    hwid = u["hwid_limit"] if u else 1
+                vol_f = float(vol) if vol is not None else 0.0
+                days_i = int(days) if days else 30
+                hwid_i = int(hwid) if hwid else 1
+                vol_label = f"{vol_f:g} گیگابایت" if vol_f else "نامحدود"
+                return {
+                    "data_limit_gb": vol_f,
+                    "expire_days": days_i,
+                    "service_name": f"{hwid_i} کاربره | {vol_label}",
+                    "volume_label": vol_label,
+                    "duration_label": f"{days_i} روزه",
+                    "hwid_limit": hwid_i,
+                }
+        except Exception:
+            logging.exception("multi structured parse")
+        return _spec_from_label(plan["label"] or plan_name or "")
+    return _spec_from_label(plan_name or "")
 
 
 async def _process_referral_commission(order, order_id: int) -> None:
@@ -3355,6 +3560,260 @@ async def admin_reset_freetest(message: Message):
         await con.execute("DELETE FROM free_tests WHERE user_id = ?", (uid,))
         await con.commit()
     await message.answer(f"✅ سابقه تست کاربر <code>{uid}</code> پاک شد. می‌تواند دوباره تست بگیرد.", parse_mode="HTML")
+
+
+
+# ---------- Admin multi hierarchy (مدت / کاربر / پلن) ----------
+@dp.callback_query(F.data == "mm:durations")
+async def mm_durations(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text(
+            "⏳ <b>مدت‌های مولتی</b>\nافزودن / فعال-غیرفعال / حذف",
+            parse_mode="HTML",
+            reply_markup=await multi_durations_admin_kb(),
+        )
+    except Exception as e:
+        logging.exception("mm_durations")
+        await callback.message.answer(f"خطا: {e}", reply_markup=await multi_durations_admin_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mm:users")
+async def mm_users(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text(
+            "👤 <b>تعداد کاربر مولتی</b>\nافزودن / فعال-غیرفعال / حذف",
+            parse_mode="HTML",
+            reply_markup=await multi_users_admin_kb(),
+        )
+    except Exception as e:
+        logging.exception("mm_users")
+        await callback.message.answer(f"خطا: {e}", reply_markup=await multi_users_admin_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mm:plans")
+async def mm_plans(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text(
+            "📊 <b>پلن‌های مولتی</b>\nحجم + قیمت برای هر ترکیب مدت و کاربر",
+            parse_mode="HTML",
+            reply_markup=await multi_plans_admin_kb(),
+        )
+    except Exception as e:
+        logging.exception("mm_plans")
+        await callback.message.answer(f"خطا: {e}", reply_markup=await multi_plans_admin_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mm:duradd")
+async def mm_duradd(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.set_state(AdminStates.adding_multi_duration_label)
+    await callback.message.answer("نام مدت را بفرستید (مثلاً: ۱ ماهه):")
+    await callback.answer()
+
+
+@dp.message(AdminStates.adding_multi_duration_label)
+async def mm_dur_label(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.update_data(mdur_label=(message.text or "").strip())
+    await state.set_state(AdminStates.adding_multi_duration_days)
+    await message.answer("تعداد روز را عدد بفرستید (مثلاً 30):")
+
+
+@dp.message(AdminStates.adding_multi_duration_days)
+async def mm_dur_days(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    try:
+        days = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("عدد معتبر بفرستید.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    await db.add_multi_duration(data.get("mdur_label") or f"{days} روزه", days)
+    await message.answer("✅ مدت اضافه شد.", reply_markup=await multi_durations_admin_kb())
+
+
+@dp.callback_query(F.data.startswith("mm:durtog:"))
+async def mm_durtog(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await db.toggle_multi_duration(int(callback.data.split(":")[2]))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=await multi_durations_admin_kb())
+    except Exception:
+        await callback.message.edit_text("⏳ مدت‌ها", reply_markup=await multi_durations_admin_kb())
+    await callback.answer("عوض شد")
+
+
+@dp.callback_query(F.data.startswith("mm:durdel:"))
+async def mm_durdel(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await db.delete_multi_duration(int(callback.data.split(":")[2]))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=await multi_durations_admin_kb())
+    except Exception:
+        await callback.message.edit_text("⏳ مدت‌ها", reply_markup=await multi_durations_admin_kb())
+    await callback.answer("حذف شد")
+
+
+@dp.callback_query(F.data == "mm:uoadd")
+async def mm_uoadd(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.set_state(AdminStates.adding_multi_user_label)
+    await callback.message.answer("نام را بفرستید (مثلاً: دو کاربره):")
+    await callback.answer()
+
+
+@dp.message(AdminStates.adding_multi_user_label)
+async def mm_uo_label(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.update_data(muo_label=(message.text or "").strip())
+    await state.set_state(AdminStates.adding_multi_user_limit)
+    await message.answer("حداکثر تعداد دستگاه/کاربر (عدد، مثلاً 2):")
+
+
+@dp.message(AdminStates.adding_multi_user_limit)
+async def mm_uo_limit(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    try:
+        lim = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("عدد معتبر بفرستید.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    await db.add_multi_user_option(data.get("muo_label") or f"{lim} کاربره", lim)
+    await message.answer("✅ اضافه شد.", reply_markup=await multi_users_admin_kb())
+
+
+@dp.callback_query(F.data.startswith("mm:uotog:"))
+async def mm_uotog(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await db.toggle_multi_user_option(int(callback.data.split(":")[2]))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=await multi_users_admin_kb())
+    except Exception:
+        await callback.message.edit_text("👤 تعداد کاربر", reply_markup=await multi_users_admin_kb())
+    await callback.answer("عوض شد")
+
+
+@dp.callback_query(F.data.startswith("mm:uodel:"))
+async def mm_uodel(callback: CallbackQuery):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await db.delete_multi_user_option(int(callback.data.split(":")[2]))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=await multi_users_admin_kb())
+    except Exception:
+        await callback.message.edit_text("👤 تعداد کاربر", reply_markup=await multi_users_admin_kb())
+    await callback.answer("حذف شد")
+
+
+@dp.callback_query(F.data == "mm:planadd")
+async def mm_planadd(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    durs = await db.get_multi_durations(active_only=True)
+    if not durs:
+        await callback.answer("اول مدت اضافه کنید.", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=d["label"], callback_data=f"mm:padd_d:{d['id']}")] for d in durs]
+    rows.append([InlineKeyboardButton(text="🔙", callback_data="mm:plans")])
+    await callback.message.edit_text("مدت این پلن را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mm:padd_d:"))
+async def mm_padd_d(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    dur_id = int(callback.data.split(":")[2])
+    await state.update_data(padd_dur=dur_id)
+    opts = await db.get_multi_user_options(active_only=True)
+    if not opts:
+        await callback.answer("اول تعداد کاربر اضافه کنید.", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=o["label"], callback_data=f"mm:padd_u:{o['id']}")] for o in opts]
+    rows.append([InlineKeyboardButton(text="🔙", callback_data="mm:planadd")])
+    await callback.message.edit_text("تعداد کاربر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mm:padd_u:"))
+async def mm_padd_u(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in config.ADMIN_IDS:
+        return
+    await state.update_data(padd_uo=int(callback.data.split(":")[2]))
+    await state.set_state(AdminStates.adding_multi_plan_vol)
+    await callback.message.answer("حجم را به گیگ بفرستید (مثلاً 20 یا 50):")
+    await callback.answer()
+
+
+@dp.message(AdminStates.adding_multi_plan_vol)
+async def mm_padd_vol(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    try:
+        vol = float((message.text or "").replace(",", ".").strip())
+    except ValueError:
+        await message.answer("عدد معتبر بفرستید.")
+        return
+    await state.update_data(padd_vol=vol)
+    await state.set_state(AdminStates.adding_multi_plan_price)
+    await message.answer("قیمت به تومان (عدد):")
+
+
+@dp.message(AdminStates.adding_multi_plan_price)
+async def mm_padd_price(message: Message, state: FSMContext):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    raw = (message.text or "").replace(",", "").replace("،", "").strip()
+    try:
+        price = int(raw)
+    except ValueError:
+        await message.answer("قیمت عدد باشد.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    dur_id = data.get("padd_dur")
+    uo_id = data.get("padd_uo")
+    vol = data.get("padd_vol")
+    dur = await db.get_multi_duration(dur_id)
+    uo = await db.get_multi_user_option(uo_id)
+    label = f"{dur['label'] if dur else ''} | {uo['label'] if uo else ''} | {vol:g} گیگ"
+    await db.add_multi_plan_full(
+        label=label,
+        price=price,
+        duration_id=dur_id,
+        user_option_id=uo_id,
+        volume_gb=float(vol),
+        duration_days=int(dur["days"]) if dur else 30,
+        hwid_limit=int(uo["hwid_limit"]) if uo else 1,
+    )
+    await message.answer(f"✅ پلن اضافه شد:\n{label}\n{price:,} تومان", reply_markup=await multi_plans_admin_kb())
 
 
 # ---------- Startup ----------

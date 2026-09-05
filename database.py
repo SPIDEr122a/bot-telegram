@@ -62,6 +62,39 @@ async def init_db():
             )
             """
         )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS multi_durations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                active INTEGER DEFAULT 1
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS multi_user_options (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                hwid_limit INTEGER NOT NULL DEFAULT 1,
+                active INTEGER DEFAULT 1
+            )
+            """
+        )
+        for col_sql in (
+            "ALTER TABLE multi_plans ADD COLUMN duration_id INTEGER",
+            "ALTER TABLE multi_plans ADD COLUMN user_option_id INTEGER",
+            "ALTER TABLE multi_plans ADD COLUMN volume_gb REAL",
+            "ALTER TABLE multi_plans ADD COLUMN duration_days INTEGER",
+            "ALTER TABLE multi_plans ADD COLUMN hwid_limit INTEGER",
+        ):
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except Exception:
+                pass
         # دسته‌های تعرفه سفارشی (مثل «اختلالات شدید»)
         await db.execute(
             """
@@ -248,6 +281,25 @@ async def init_db():
             for label, price in config.DEFAULT_MULTI_PLANS:
                 await db.execute(
                     "INSERT INTO multi_plans (label, price, active) VALUES (?, ?, 1)", (label, price)
+                )
+            await db.commit()
+
+        cursor = await db.execute("SELECT COUNT(*) FROM multi_durations")
+        row = await cursor.fetchone()
+        if row[0] == 0:
+            for label, days in (("۱ ماهه", 30), ("۳ ماهه", 90), ("۶ ماهه", 180)):
+                await db.execute(
+                    "INSERT INTO multi_durations (label, days, active) VALUES (?, ?, 1)",
+                    (label, days),
+                )
+            await db.commit()
+        cursor = await db.execute("SELECT COUNT(*) FROM multi_user_options")
+        row = await cursor.fetchone()
+        if row[0] == 0:
+            for label, lim in (("تک کاربره", 1), ("دو کاربره", 2), ("سه کاربره", 3)):
+                await db.execute(
+                    "INSERT INTO multi_user_options (label, hwid_limit, active) VALUES (?, ?, 1)",
+                    (label, lim),
                 )
             await db.commit()
 
@@ -1157,4 +1209,128 @@ async def set_default_panel(panel_id: int) -> None:
         await db.execute("UPDATE panels SET is_default = 0")
         await db.execute("UPDATE panels SET is_default = 1, is_active = 1 WHERE id = ?", (panel_id,))
         await db.commit()
+
+
+# ---------- مولتی سلسله‌مراتبی: مدت / کاربر / پلن ----------
+async def get_multi_durations(active_only: bool = True):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = "SELECT * FROM multi_durations"
+        if active_only:
+            q += " WHERE active = 1"
+        q += " ORDER BY days ASC, id ASC"
+        cur = await db.execute(q)
+        return await cur.fetchall()
+
+
+async def get_multi_duration(dur_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM multi_durations WHERE id = ?", (dur_id,))
+        return await cur.fetchone()
+
+
+async def add_multi_duration(label: str, days: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO multi_durations (label, days, active) VALUES (?, ?, 1)",
+            (label, days),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def toggle_multi_duration(dur_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE multi_durations SET active = 1 - active WHERE id = ?", (dur_id,))
+        await db.commit()
+
+
+async def delete_multi_duration(dur_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM multi_durations WHERE id = ?", (dur_id,))
+        await db.commit()
+
+
+async def get_multi_user_options(active_only: bool = True):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = "SELECT * FROM multi_user_options"
+        if active_only:
+            q += " WHERE active = 1"
+        q += " ORDER BY hwid_limit ASC, id ASC"
+        cur = await db.execute(q)
+        return await cur.fetchall()
+
+
+async def get_multi_user_option(opt_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM multi_user_options WHERE id = ?", (opt_id,))
+        return await cur.fetchone()
+
+
+async def add_multi_user_option(label: str, hwid_limit: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO multi_user_options (label, hwid_limit, active) VALUES (?, ?, 1)",
+            (label, hwid_limit),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def toggle_multi_user_option(opt_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE multi_user_options SET active = 1 - active WHERE id = ?", (opt_id,))
+        await db.commit()
+
+
+async def delete_multi_user_option(opt_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM multi_user_options WHERE id = ?", (opt_id,))
+        await db.commit()
+
+
+async def get_multi_plans_filtered(
+    duration_id: int | None = None,
+    user_option_id: int | None = None,
+    active_only: bool = True,
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = "SELECT * FROM multi_plans WHERE 1=1"
+        params = []
+        if active_only:
+            q += " AND active = 1"
+        if duration_id is not None:
+            q += " AND duration_id = ?"
+            params.append(duration_id)
+        if user_option_id is not None:
+            q += " AND user_option_id = ?"
+            params.append(user_option_id)
+        q += " ORDER BY price ASC, id ASC"
+        cur = await db.execute(q, params)
+        return await cur.fetchall()
+
+
+async def add_multi_plan_full(
+    *,
+    label: str,
+    price: int,
+    duration_id: int | None = None,
+    user_option_id: int | None = None,
+    volume_gb: float | None = None,
+    duration_days: int | None = None,
+    hwid_limit: int | None = None,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO multi_plans
+               (label, price, active, duration_id, user_option_id, volume_gb, duration_days, hwid_limit)
+               VALUES (?, ?, 1, ?, ?, ?, ?, ?)""",
+            (label, price, duration_id, user_option_id, volume_gb, duration_days, hwid_limit),
+        )
+        await db.commit()
+        return cur.lastrowid
 
